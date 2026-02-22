@@ -2,11 +2,11 @@
 #SBATCH --job-name=smk_orchestrator
 #SBATCH --output=logs/orchestrator_%j.out
 #SBATCH --error=logs/orchestrator_%j.err
-#SBATCH --time=1-00:00:00
+#SBATCH --time=7-00:00:00
 #SBATCH --mem=4G
 #SBATCH --cpus-per-task=1
 #SBATCH --partition=shared
-#SBATCH --account=carmody_lab
+#SBATCH --account=
 
 set -euo pipefail
 

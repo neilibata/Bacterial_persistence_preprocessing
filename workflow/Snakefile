@@ -1,7 +1,7 @@
 """
 Snakefile — Bacterial Evolution & Health Pipeline
 ===================================================
-End-to-end: SRA accession list → per-species coverage statistics.
+End-to-end: SRA accession list → per-species coverage matrices.
 
 Designed to run on ANY SLURM cluster. All cluster-specific settings
 (partitions, accounts, thread counts) are read from config/config.yaml.
@@ -36,16 +36,22 @@ PREPROC_THREADS = int(config.get("preprocess_threads", 8))
 # Intermediate file cleanup
 # =========================================================================
 # By default, intermediate files are deleted after downstream rules succeed.
-# Repaired reads and final outputs are always kept.
+# Repaired reads, coverage files, and final outputs are always kept.
 # Set keep_all: true in config.yaml to disable cleanup entirely.
 # =========================================================================
 KEEP_ALL = config.get("keep_all", False)
+KEEP_REPAIRED_READS = config.get("keep_repaired_reads", True)
 KEEP_FILTERED_BAMS = config.get("keep_filtered_bams", True)
 
 def intermediate(path):
     """Mark a file for automatic deletion after it's no longer needed.
     Disabled when keep_all: true is set in config."""
     return path if KEEP_ALL else temp(path)
+
+def checkpoint(path, keep_flag):
+    """Mark a file as a configurable checkpoint.
+    Kept when keep_flag is True or keep_all is True; otherwise temp."""
+    return path if (keep_flag or KEEP_ALL) else temp(path)
 
 # =========================================================================
 # Sample discovery
@@ -94,7 +100,7 @@ META_IDX  = f"{REF_DIR}/metagenome/reference"
 # =========================================================================
 rule all:
     input:
-        # Per-sample CSVs (these are also produced as intermediates)
+        # Per-sample CSVs
         expand(f"{RESULTS}/aggregated/{{sample}}_depth_and_coverage_stats.csv",
                sample=SAMPLES),
         # Combined matrices (the ultimate deliverables)
@@ -271,10 +277,6 @@ rule sra_download:
 #   - Automatic resource scaling per step
 #   - intermediate() cleanup (safe: only after downstream succeeds)
 #     Disabled when keep_all: true in config.yaml
-#
-# PARALLELISM: All four rules run as separate SLURM jobs. With 200 max
-# concurrent jobs and 100 samples, ~50 samples can be preprocessing
-# simultaneously (each using 4 job slots for the 4 sub-steps).
 # =========================================================================
 
 rule trim_galore:
@@ -372,9 +374,9 @@ rule repair_mates:
         r1 = f"{RESULTS}/decontam/{{sample}}_1_human_removed.fq.gz",
         r2 = f"{RESULTS}/decontam/{{sample}}_2_human_removed.fq.gz",
     output:
-        # NOT intermediate — clean reads are kept for potential re-alignment
-        r1 = f"{RESULTS}/repaired/{{sample}}_1_repaired.fq.gz",
-        r2 = f"{RESULTS}/repaired/{{sample}}_2_repaired.fq.gz",
+        # Configurable checkpoint — kept by default for re-alignment flexibility
+        r1 = checkpoint(f"{RESULTS}/repaired/{{sample}}_1_repaired.fq.gz", KEEP_REPAIRED_READS),
+        r2 = checkpoint(f"{RESULTS}/repaired/{{sample}}_2_repaired.fq.gz", KEEP_REPAIRED_READS),
     params:
         singles_tmp = f"{RESULTS}/repaired/{{sample}}_singles.fq.gz",
     retries: 2
@@ -402,17 +404,6 @@ rule repair_mates:
 # =========================================================================
 # Bowtie2 --very-sensitive-local piped directly to samtools sort.
 # No intermediate SAM on disk (saves massive disk space).
-#
-# PARALLELISM: Each sample gets its own SLURM job with ALIGN_THREADS
-# cores for bowtie2. With max_jobs=200 and align_threads=20, you can
-# run ~10 alignments concurrently on a 200-core allocation, while other
-# samples run preprocessing or downstream steps on separate nodes.
-#
-# The original pipeline used xargs -P 4 to run 4 samples per node with
-# 80 cores total (20 per sample). Snakemake achieves the same parallelism
-# by submitting 4 separate jobs, each requesting 20 cores. This is better
-# because: (a) if one sample fails, only that job fails, and (b) Snakemake
-# can dynamically allocate threads per sample.
 # =========================================================================
 
 rule align:
@@ -463,8 +454,8 @@ rule filter_mapq:
     input:
         bam = f"{RESULTS}/aligned/{{sample}}.sorted.bam",
     output:
-        high = f"{RESULTS}/filtered/high/{{sample}}_high_mapq.bam" if (KEEP_FILTERED_BAMS or KEEP_ALL) else intermediate(f"{RESULTS}/filtered/high/{{sample}}_high_mapq.bam"),
-        low  = f"{RESULTS}/filtered/low/{{sample}}_low_mapq.bam" if (KEEP_FILTERED_BAMS or KEEP_ALL) else intermediate(f"{RESULTS}/filtered/low/{{sample}}_low_mapq.bam"),
+        high = checkpoint(f"{RESULTS}/filtered/high/{{sample}}_high_mapq.bam", KEEP_FILTERED_BAMS),
+        low  = checkpoint(f"{RESULTS}/filtered/low/{{sample}}_low_mapq.bam", KEEP_FILTERED_BAMS),
     params:
         mapq = config.get("mapq_threshold", 30),
     threads: 4
@@ -491,8 +482,7 @@ rule filter_mapq:
 # =========================================================================
 # samtools coverage → per-contig depth + breadth of coverage.
 # Uses {tier} wildcard to handle both "high" and "low" with one rule.
-#
-# Lightweight rule — runs on shared partition with minimal resources.
+# Coverage files are always kept (small; useful for downstream analysis).
 # =========================================================================
 
 rule extract_coverage:

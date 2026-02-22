@@ -1,6 +1,6 @@
 # Bacterial Evolution & Health Pipeline
 
-A Snakemake pipeline that processes shotgun metagenomic data from raw SRA accessions to per-species coverage statistics on any SLURM cluster. Built for investigating bacterial evolutionary dynamics across human populations.
+A Snakemake pipeline that processes shotgun metagenomic data from raw SRA accessions to per-species coverage matrices on any SLURM cluster. Built for investigating bacterial evolutionary dynamics across human populations.
 
 ## What You Provide
 
@@ -10,7 +10,7 @@ A Snakemake pipeline that processes shotgun metagenomic data from raw SRA access
 | `resources/reference_metagenome.fna` | Your metagenome reference FASTA (e.g. UHGG subset) |
 | `resources/contig_to_species.tsv` | Mapping: `species_id <TAB> contig_name <TAB> length` |
 
-Everything else — downloading PhiX/hg38 genomes, building all Bowtie2 indices, QC, alignment, filtering, coverage extraction, and aggregation — runs automatically.
+Everything else — downloading PhiX/hg38 genomes, building all Bowtie2 indices, QC, alignment, filtering, coverage extraction, aggregation, and matrix combination — runs automatically.
 
 ## Quick Start
 
@@ -25,7 +25,7 @@ conda activate bact_evo_pipeline
 
 # 3. Place your three input files in resources/
 
-# 4. Run interactive setup (detects partitions, writes config)
+# 4. Run interactive setup (detects partitions, conda path, writes config)
 bash setup.sh
 
 # 5. Preview what would run
@@ -65,7 +65,15 @@ bash run_pipeline.sh --status
     │  Aggregate  │        │  Aggregate  │        │  Aggregate  │
     │     ↓       │        │     ↓       │        │     ↓       │
     │   CSV out   │        │   CSV out   │        │   CSV out   │
-    └─────────────┘        └─────────────┘        └─────────────┘
+    └──────┬──────┘        └──────┬──────┘        └──────┬──────┘
+           │                      │                      │
+           └──────────────────────┼──────────────────────┘
+                                  ▼
+                    ┌──────────────────────────┐
+                    │   Combine into matrices   │
+                    │  depth_matrix.csv         │
+                    │  coverage_matrix.csv      │
+                    └──────────────────────────┘
 
          ALL SAMPLES RUN IN PARALLEL on separate SLURM jobs
 ```
@@ -120,7 +128,45 @@ sbatch run_pipeline.sh
 
 ### 3. Safe intermediate cleanup
 
-Intermediate files (trimmed reads, aligned BAMs) are automatically deleted **only after** the downstream step succeeds. If a job fails mid-pipeline, the last good intermediate is preserved.
+Intermediate files (raw FASTQs, trimmed reads, aligned BAMs) are automatically deleted **only after** the downstream step succeeds. If a job fails mid-pipeline, the last good intermediate is preserved. See [Disk Space Management](#disk-space-management) below.
+
+## Disk Space Management
+
+The pipeline automatically cleans up intermediate files to save disk space (~5-10x reduction). Two config options control this behavior:
+
+```yaml
+# config/config.yaml
+
+# Set to true to keep ALL intermediate files (uses ~5-10x more disk):
+keep_all: false
+
+# Keep repaired reads as a re-alignment checkpoint (and for other projects).
+# Set to false for large-scale runs to save ~4GB per sample:
+keep_repaired_reads: true
+
+# Keep filtered BAMs for downstream analysis.
+# Set to false to delete them after coverage extraction:
+keep_filtered_bams: true
+```
+
+**What gets cleaned up vs. kept:**
+
+| Stage | Files | Default behavior |
+|---|---|---|
+| Raw FASTQs | `results/fastq/` | Deleted after trimming |
+| Trimmed reads | `results/trimmed/` | Deleted after PhiX removal |
+| PhiX-cleaned | `results/decontam/*_phiX_*` | Deleted after human removal |
+| Human-cleaned | `results/decontam/*_human_*` | Deleted after repair |
+| **Repaired reads** | `results/repaired/` | **Kept** (configurable) |
+| Aligned BAMs | `results/aligned/` | Deleted after MAPQ filtering |
+| **Filtered BAMs** | `results/filtered/` | **Kept** (configurable) |
+| **Coverage files** | `results/coverage/` | **Always kept** |
+| **Aggregated CSVs** | `results/aggregated/` | **Always kept** |
+| **Final matrices** | `results/matrices/` | **Always kept** |
+
+**For large-scale runs (thousands of samples)**, set both `keep_repaired_reads: false` and `keep_filtered_bams: false`, and consider reducing `align_threads` to 8 while increasing `max_jobs` to 990 for better throughput.
+
+Cleanup is safe: Snakemake only deletes an intermediate file **after** the rule consuming it has completed successfully.
 
 ## Parallelism Design
 
@@ -148,7 +194,8 @@ Bacterial_evolution_health/
 ├── workflow/
 │   ├── Snakefile                  pipeline rules
 │   └── scripts/
-│       └── aggregate_coverage.py  contig → species aggregation
+│       ├── aggregate_coverage.py  contig → species aggregation
+│       └── combine_aggregated_stats.py  per-sample → matrices
 ├── profiles/
 │   └── slurm/
 │       ├── config.yaml            SLURM submission settings
@@ -161,14 +208,15 @@ Bacterial_evolution_health/
 
 results/                           (created by pipeline)
 ├── references/                    PhiX + hg38 + metagenome indices
-├── fastq/                         downloaded raw FASTQs
+├── fastq/                         (temp — auto-deleted)
 ├── trimmed/                       (temp — auto-deleted)
 ├── decontam/                      (temp — auto-deleted)
-├── repaired/                      clean reads (KEPT)
+├── repaired/                      ★ clean reads (KEPT by default)
 ├── aligned/                       (temp — auto-deleted)
-├── filtered/{high,low}/           MAPQ-split BAMs (KEPT)
-├── coverage/{high,low}/           per-contig coverage (KEPT)
-└── aggregated/                    ★ final per-species CSVs ★
+├── filtered/{high,low}/           ★ MAPQ-split BAMs (KEPT by default)
+├── coverage/{high,low}/           ★ per-contig coverage (KEPT)
+├── aggregated/                    ★ per-species CSVs (KEPT)
+└── matrices/                      ★ final sample × species matrices ★
 ```
 
 ## Common Operations
@@ -223,7 +271,7 @@ The pipeline uses **no hardcoded cluster paths**. Everything is configured throu
 | `align_threads` | Cores per alignment job |
 | `preprocess_threads` | Cores per preprocessing job |
 
-Run `bash setup.sh` to detect your cluster's partitions and configure automatically.
+Run `bash setup.sh` to detect your cluster's partitions and configure automatically. The setup script also auto-detects your conda installation path and writes a `precommand` into the SLURM profile so that child jobs activate the correct environment.
 
 ### Clusters without internet on compute nodes
 
@@ -251,7 +299,7 @@ sbatch run_pipeline.sh
 
 ## Output
 
-One CSV per sample in `results/aggregated/`:
+### Per-sample CSVs (`results/aggregated/`)
 
 | Column | Description |
 |---|---|
@@ -261,16 +309,26 @@ One CSV per sample in `results/aggregated/`:
 | `Weighted_Mean_Coverage` | Breadth of coverage (0–1), weighted by contig length |
 | `Weighted_Std_Dev_Coverage` | Weighted standard deviation of coverage |
 
+### Combined matrices (`results/matrices/`)
+
+Two sample × species matrices are produced as the final deliverables:
+
+- **`depth_matrix.csv`** — rows = samples, columns = `Sample_ID` + `{species}_mean` + `{species}_std` for depth
+- **`coverage_matrix.csv`** — same layout for breadth-of-coverage
+
+Species column order is fixed by `contig_to_species.tsv`, so all matrices are directly comparable.
+
 ## Software
 
 All installed via `environment.yaml`:
 
 | Tool | Stage |
 |---|---|
-| Snakemake ≥ 7.25 | Orchestration |
+| Snakemake ≥ 8.0 | Orchestration |
+| snakemake-executor-plugin-slurm | SLURM integration |
 | SRA Toolkit + pigz | Download |
 | Trim Galore | Preprocessing |
 | Bowtie2 | Preprocessing + Alignment |
 | BBTools (repair.sh) | Preprocessing |
 | samtools | Alignment + Filtering + Coverage |
-| Python + pandas | Aggregation |
+| Python + pandas | Aggregation + Matrix combination |

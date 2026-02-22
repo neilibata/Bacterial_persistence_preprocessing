@@ -17,7 +17,8 @@ channels:
   - defaults
 dependencies:
   # Workflow manager
-  - snakemake>=7.25
+  - snakemake>=8.0
+  - snakemake-executor-plugin-slurm
 
   # Stage 1: SRA download
   - sra-tools>=3.0
@@ -32,7 +33,7 @@ dependencies:
   # Stages 3-5: Alignment, filtering, coverage
   - samtools>=1.17
 
-  # Stage 6: Aggregation
+  # Stage 6-7: Aggregation + matrix combination
   - python>=3.9
   - pandas>=1.5
 

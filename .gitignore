@@ -14,7 +14,7 @@ logs/
 *.out
 *.err
 
-# Large user data (commit the templates but not actual data)
+# Large input files (commit the templates but not actual data)
 # Uncomment if you don't want to track your actual input files:
 # resources/reference_metagenome.fna
 # resources/contig_to_species.tsv
@@ -32,3 +32,6 @@ Thumbs.db
 *.swp
 *~
 .vscode/
+
+# Config backups from setup.sh re-runs
+config/config.yaml.bak.*
