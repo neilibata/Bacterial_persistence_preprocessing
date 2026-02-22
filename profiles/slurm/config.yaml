@@ -1,0 +1,18 @@
+# Snakemake 8/9 SLURM profile
+# Requires: pip install snakemake-executor-plugin-slurm
+
+executor: slurm
+jobs: 200
+latency-wait: 120
+keep-going: true
+rerun-incomplete: true
+printshellcmds: true
+
+# Activate conda in every child SLURM job so tools are in PATH
+precommand: "source /n/home00/nibata/miniconda3/etc/profile.d/conda.sh && conda activate bact_evo_pipeline"
+
+default-resources:
+  - slurm_partition=shared
+  - mem_mb=4000
+  - runtime=60
+  - slurm_account=carmody_lab

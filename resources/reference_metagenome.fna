@@ -1,0 +1,12 @@
+This file replaced a symlink when the repository was published.
+
+v1.0 resolved the reference catalogue through a symlink at this path. On the
+machine that built the published matrices it pointed at the Carter
+(Hadza_UHGG) catalogue. That target was an absolute path on that machine,
+reproducible nowhere else, so it was replaced with this note.
+
+This is NOT a FASTA file, and the Quick Start cannot be followed from inside
+a v1.x tag. To reproduce the published matrices, build the catalogue with
+build_references.py from `main` -- it checks every contig name and length
+against a manifest, which the original never did -- and point
+config/config.yaml at the result.

@@ -1,0 +1,40 @@
+# environment.yaml — Conda environment for the pipeline
+# =========================================================================
+# Creates one environment with ALL tools needed by every stage.
+#
+# Install:
+#   conda env create -f environment.yaml
+#   conda activate bact_evo_pipeline
+#
+# Or with mamba (faster):
+#   mamba env create -f environment.yaml
+# =========================================================================
+
+name: bact_evo_pipeline
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  # Workflow manager
+  - snakemake>=7.25
+
+  # Stage 1: SRA download
+  - sra-tools>=3.0
+  - pigz
+
+  # Stage 2: Preprocessing
+  - trim-galore>=0.6
+  - cutadapt            # required by trim-galore
+  - bowtie2>=2.5
+  - bbmap               # provides repair.sh
+
+  # Stages 3-5: Alignment, filtering, coverage
+  - samtools>=1.17
+
+  # Stage 6: Aggregation
+  - python>=3.9
+  - pandas>=1.5
+
+  # Utilities
+  - curl

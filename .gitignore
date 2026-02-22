@@ -1,0 +1,34 @@
+# Pipeline outputs (large — never commit)
+results/
+
+# Snakemake internals
+.snakemake/
+pipeline_report.html
+pipeline_dag.png
+pipeline_dag.dot
+
+# Logs
+logs/
+
+# SLURM
+*.out
+*.err
+
+# Large user data (commit the templates but not actual data)
+# Uncomment if you don't want to track your actual input files:
+# resources/reference_metagenome.fna
+# resources/contig_to_species.tsv
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*~
+.vscode/
