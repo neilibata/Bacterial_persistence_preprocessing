@@ -25,8 +25,14 @@
 > 6. `bowtie2 -p N` plus `samtools --threads 4` twice requested more threads than
 >    the allocation had.
 > 7. No record of tool versions, so v1.0 outputs cannot be tied to specific builds.
+> 8. Every accession was treated as its own sample, so a sample sequenced across
+>    several runs produced one matrix row *per run* instead of one per sample.
+>    16% of this cohort is multi-run. The damage is not repairable after the
+>    fact — breadth is a percentage of genome covered, so per-run breadths
+>    cannot be pooled without the original alignments; 89 samples had to be
+>    reprocessed from raw reads. *(Fixed in v3.0.)*
 >
-> v2.0 fixes all seven. Outputs are written as **dated shards**
+> v2.0 fixes 1–7; v3.0 fixes 8. Outputs are written as **dated shards**
 > (`depth_matrix_YYYYMMDD.csv`) and merged into the canonical matrix, so a
 > backfill never rewrites samples that are already done.
 
