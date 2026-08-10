@@ -20,6 +20,7 @@ configfile: "config/config.yaml"
 
 import os
 import re
+import datetime
 
 # =========================================================================
 # Read cluster settings from config
@@ -29,8 +30,40 @@ PART_SHARED   = config.get("partition_shared",   "shared")
 PART_DOWNLOAD = config.get("partition_download", PART_CPU)
 SLURM_ACCOUNT = config.get("slurm_account",     "")
 
-ALIGN_THREADS   = int(config.get("align_threads",      20))
+ALIGN_THREADS   = int(config.get("align_threads",      16))
 PREPROC_THREADS = int(config.get("preprocess_threads", 8))
+
+# Partition for memory-hungry work on large samples. FASRC `shared` gives
+# 3.6 GB/core (48c/172GB); `sapphire` gives 8.8 GB/core (112c/990GB), which is
+# what the long tail of deeply-sequenced samples needs.
+PART_BIGMEM   = config.get("partition_bigmem",  "sapphire")
+BIG_SAMPLE_MB = int(config.get("big_sample_mb", 15000))
+
+
+def part_by_size(wc, input):
+    """Send large inputs to the high-memory-per-core partition."""
+    try:
+        return PART_BIGMEM if input.size_mb > BIG_SAMPLE_MB else PART_CPU
+    except Exception:
+        return PART_CPU
+
+
+def align_mem(wc, input, attempt):
+    """Bowtie2 memory is dominated by the resident index, not the read count.
+
+    The index is constant (~9 GB for a 3,600-genome catalogue, more for larger
+    ones) and reads are streamed, so alignment memory is essentially flat in
+    sample size. Only `samtools sort` scales, and that is capped by -m x threads.
+    The previous `input.size_mb * 5` model under-provisioned large samples --
+    20 GB against a ~9 GB index plus 8 GB of sort buffers is close enough to the
+    limit to be OOM-killed, which removes the sample silently under --keep-going.
+    """
+    return int(config.get("align_mem_mb", 40000)) * attempt
+
+
+def repair_mem(wc, input, attempt):
+    """repair.sh buffers reads to re-pair them, so this one genuinely scales."""
+    return int(max(32000, input.size_mb * 4)) * attempt
 
 # =========================================================================
 # Intermediate file cleanup
@@ -87,6 +120,13 @@ print(f"[Pipeline] {len(SAMPLES)} samples auto-detected from {SAMPLES_TSV}")
 # =========================================================================
 # Derived paths
 # =========================================================================
+# Each run writes its own dated matrix shard rather than overwriting one file.
+# Column order is fixed by contig_to_species, so shards are column-identical and
+# concatenate safely -- a backfill of a few hundred samples never has to rebuild,
+# or risk, the samples already processed.
+MATRIX_VERSION = config.get("matrix_version",
+                            datetime.date.today().strftime("%Y%m%d"))
+
 RESULTS   = config.get("results_dir", "results")
 REF_DIR   = f"{RESULTS}/references"
 FASTQ_DIR = f"{RESULTS}/fastq"
@@ -103,9 +143,16 @@ rule all:
         # Per-sample CSVs
         expand(f"{RESULTS}/aggregated/{{sample}}_depth_and_coverage_stats.csv",
                sample=SAMPLES),
-        # Combined matrices (the ultimate deliverables)
+        # This run's dated shard
+        f"{RESULTS}/matrices/depth_matrix_{MATRIX_VERSION}.csv",
+        f"{RESULTS}/matrices/coverage_matrix_{MATRIX_VERSION}.csv",
+        # Canonical matrices, merged from every shard present
         f"{RESULTS}/matrices/depth_matrix.csv",
         f"{RESULTS}/matrices/coverage_matrix.csv",
+        # Completeness proof for the samples THIS run was asked to produce
+        f"{RESULTS}/matrices/completeness_report.tsv",
+        # What produced these outputs
+        f"{RESULTS}/provenance/software_versions_{MATRIX_VERSION}.txt",
 
 
 # =========================================================================
@@ -379,16 +426,21 @@ rule repair_mates:
         r2 = checkpoint(f"{RESULTS}/repaired/{{sample}}_2_repaired.fq.gz", KEEP_REPAIRED_READS),
     params:
         singles_tmp = f"{RESULTS}/repaired/{{sample}}_singles.fq.gz",
+    threads: 4
     retries: 2
     resources:
-        mem_mb    = lambda wc, input, attempt: max(8000, int(input.size_mb * 3)) * attempt,
-        runtime   = lambda wc, input, attempt: max(30,   int(input.size_mb / 80)) * attempt,
-        slurm_partition = PART_CPU,
+        mem_mb    = repair_mem,
+        runtime   = lambda wc, input, attempt: max(60,   int(input.size_mb / 60)) * attempt,
+        slurm_partition = part_by_size,
     log: "logs/02_repair/{sample}.log"
     shell:
         """
         mkdir -p $(dirname {output.r1})
-        repair.sh \
+        # BBTools is a JVM app: without -Xmx it sizes the heap from NODE memory
+        # (172 GB on a shared node) and is then OOM-killed by the cgroup at the
+        # requested limit. Cap it just under what SLURM actually granted.
+        XMX_MB=$(( {resources.mem_mb} * 85 / 100 ))
+        repair.sh -Xmx${{XMX_MB}}m \
             in1={input.r1} in2={input.r2} \
             out1={output.r1} out2={output.r2} \
             outs={params.singles_tmp} \
@@ -420,9 +472,9 @@ rule align:
     threads: ALIGN_THREADS
     retries: 2
     resources:
-        mem_mb    = lambda wc, input, attempt: max(20000, int(input.size_mb * 5)) * attempt,
-        runtime   = lambda wc, input, attempt: max(120,   int(input.size_mb / 20)) * attempt,
-        slurm_partition = PART_CPU,
+        mem_mb    = align_mem,
+        runtime   = lambda wc, input, attempt: max(180,   int(input.size_mb / 12)) * attempt,
+        slurm_partition = part_by_size,
     log: "logs/03_align/{sample}.log"
     shell:
         # Pipe: bowtie2 → samtools view → samtools sort
@@ -430,15 +482,23 @@ rule align:
         """
         set -o pipefail
 
+        # Thread budget: bowtie2 gets {threads}-6, samtools gets 3+3. Previously
+        # bowtie2 took all {threads} while samtools took another 8 on top, so a
+        # 20-core allocation was asked to run 28 threads.
+        BT2_THREADS=$(( {threads} - 6 )); [ "$BT2_THREADS" -lt 1 ] && BT2_THREADS=1
+
+        # --mm memory-maps the index so concurrent jobs on one node share a
+        # single copy in page cache. No effect on output.
         (bowtie2 -x {params.idx} \
             -1 {input.r1} -2 {input.r2} \
             --very-sensitive-local \
-            -p {threads} \
-        | samtools view -Sb --threads 4 - \
-        | samtools sort -o {output.bam} --threads 4 -m 2G \
+            --mm \
+            -p "$BT2_THREADS" \
+        | samtools view -Sb --threads 3 - \
+        | samtools sort -o {output.bam} --threads 3 -m 1G \
         ) 2> {log}
 
-        samtools index -@ 4 {output.bam} 2>> {log}
+        samtools index -@ 3 {output.bam} 2>> {log}
         """
 
 
@@ -558,12 +618,13 @@ rule combine_matrices:
         csvs = expand(f"{RESULTS}/aggregated/{{sample}}_depth_and_coverage_stats.csv",
                        sample=SAMPLES),
     output:
-        depth    = f"{RESULTS}/matrices/depth_matrix.csv",
-        coverage = f"{RESULTS}/matrices/coverage_matrix.csv",
+        depth    = f"{RESULTS}/matrices/depth_matrix_{MATRIX_VERSION}.csv",
+        coverage = f"{RESULTS}/matrices/coverage_matrix_{MATRIX_VERSION}.csv",
     params:
         agg_dir    = f"{RESULTS}/aggregated",
         contig_map = config["contig_to_species"],
         out_dir    = f"{RESULTS}/matrices",
+        version    = MATRIX_VERSION,
     threads: 1
     resources:
         mem_mb         = 32000,
@@ -573,8 +634,95 @@ rule combine_matrices:
     shell:
         """
         python workflow/scripts/combine_aggregated_stats.py \
-            {params.agg_dir} \
+            --shard {params.version} \
             {params.contig_map} \
             {params.out_dir} \
+            {input.csvs} \
             &> {log}
+        """
+
+
+# =========================================================================
+#          STAGE 8: COMPLETENESS VERIFICATION
+# =========================================================================
+# Asserts that every accession in samples_tsv reached the final matrix. Without
+# this a sample can fail anywhere upstream and simply be absent, with the run
+# still reporting success.
+# =========================================================================
+
+rule verify_completeness:
+    """Fail the run if any requested accession is missing from the matrix."""
+    input:
+        matrix  = f"{RESULTS}/matrices/depth_matrix_{MATRIX_VERSION}.csv",
+        samples = SAMPLES_TSV,
+    output:
+        report = f"{RESULTS}/matrices/completeness_report.tsv",
+    threads: 1
+    resources:
+        mem_mb          = 4000,
+        runtime         = 15,
+        slurm_partition = PART_SHARED,
+    log: "logs/08_verify/completeness.log"
+    shell:
+        """
+        python workflow/scripts/verify_completeness.py \
+            {input.samples} {input.matrix} {output.report} \
+            2>&1 | tee {log}
+        """
+
+
+# =========================================================================
+#          STAGE 9: MERGE SHARDS INTO THE CANONICAL MATRIX
+# =========================================================================
+# Concatenates every dated shard into the canonical matrices. Safe because
+# shards share a column order fixed by contig_to_species; the merge refuses on
+# header mismatch or a duplicated Sample_ID.
+# =========================================================================
+
+rule merge_matrix_shards:
+    """Concatenate all dated shards into the canonical matrices."""
+    input:
+        depth_shard = f"{RESULTS}/matrices/depth_matrix_{MATRIX_VERSION}.csv",
+        cov_shard   = f"{RESULTS}/matrices/coverage_matrix_{MATRIX_VERSION}.csv",
+    output:
+        depth    = f"{RESULTS}/matrices/depth_matrix.csv",
+        coverage = f"{RESULTS}/matrices/coverage_matrix.csv",
+    params:
+        mdir = f"{RESULTS}/matrices",
+    threads: 1
+    resources:
+        mem_mb          = 8000,
+        runtime         = 60,
+        slurm_partition = PART_SHARED,
+    log: "logs/09_merge/merge.log"
+    shell:
+        """
+        python workflow/scripts/merge_matrix_shards.py \\
+            {output.depth} {params.mdir}/depth_matrix_*.csv &> {log}
+        python workflow/scripts/merge_matrix_shards.py \\
+            {output.coverage} {params.mdir}/coverage_matrix_*.csv &>> {log}
+        """
+
+
+# =========================================================================
+#          STAGE 10: PROVENANCE
+# =========================================================================
+# Captures git revision, tool versions and the conda environment for this run.
+# The original pipeline recorded none of this, so the matrices it produced
+# cannot be tied to specific tool builds. Every run from here on is traceable.
+# =========================================================================
+
+rule record_provenance:
+    """Record git revision, tool versions and conda environment."""
+    output:
+        txt = f"{RESULTS}/provenance/software_versions_{MATRIX_VERSION}.txt",
+    threads: 1
+    resources:
+        mem_mb          = 2000,
+        runtime         = 10,
+        slurm_partition = PART_SHARED,
+    log: "logs/10_provenance/record.log"
+    shell:
+        """
+        bash workflow/scripts/record_provenance.sh {output.txt} &> {log}
         """

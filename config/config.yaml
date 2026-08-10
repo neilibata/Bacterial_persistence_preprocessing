@@ -13,17 +13,37 @@ contig_to_species: "resources/contig_to_species.tsv"
 results_dir: "results"
 
 # --- SLURM ---
+# FASRC Cannon: shared = 48c/172GB (3.6 GB/core), sapphire = 112c/990GB
+# (8.8 GB/core), serial_requeue = preemptible but far more slots. Retries plus
+# rerun-incomplete make preemption cheap for the short rules.
 partition_cpu: "shared"
-partition_shared: "shared"
-partition_download: "shared"
+partition_shared: "serial_requeue"
+partition_download: "serial_requeue"
+
+# Where memory-hungry rules (align, repair) send large samples.
+partition_bigmem: "sapphire"
+
+# Inputs above this size (MB) go to partition_bigmem. The sample distribution is
+# heavily skewed: most are ~12 Gbp but a handful reach 90 Gbp, and sizing
+# everything for the tail wastes allocation while sizing for the median OOMs it.
+big_sample_mb: 15000
+
 slurm_account: ""
-max_jobs: 200
+max_jobs: 500
 
 # --- Parameters ---
 mapq_threshold: 30
 prefetch_max_size: "300G"
-align_threads: 20
+
+# Bowtie2 scales sub-linearly past ~16 threads, so more concurrent jobs beats
+# more threads per job. 6 of these go to the samtools pipe, not bowtie2.
+align_threads: 16
 preprocess_threads: 8
+
+# Alignment memory is flat in sample size: the resident bowtie2 index dominates
+# and reads are streamed. Raise this if your reference catalogue is much larger
+# than ~4,000 genomes.
+align_mem_mb: 40000
 
 # --- Intermediate file cleanup ---
 # The pipeline automatically deletes intermediate files after downstream

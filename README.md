@@ -1,5 +1,36 @@
 # Bacterial Evolution & Health Pipeline
 
+> ### Versions
+>
+> | Tag | What it is |
+> | --- | --- |
+> | **`v1.0-as-published`** | The pipeline exactly as it produced the matrices used in the manuscript. Preserved unchanged for provenance. It has known defects (below) — use it to reproduce the published matrices, not for new work. |
+> | **`v2.0`** and later | Same analysis, with the defects fixed. Use this for new processing and backfills. |
+>
+> **Defects in v1.0, all silent:**
+> 1. `combine_aggregated_stats.py` globbed the aggregated directory instead of
+>    using the file list Snakemake declared, so the matrix contained whatever was
+>    on disk — omitting samples that failed upstream, and including samples left
+>    over from earlier runs.
+> 2. An unreadable per-sample CSV was warned about and skipped; the matrix was
+>    written anyway.
+> 3. No check that every requested accession reached the matrix. 398 samples were
+>    absent from one reference catalogue and this was not discovered until
+>    analysis, months later.
+> 4. `repair.sh` (a JVM tool) ran without `-Xmx`, so it sized its heap from node
+>    memory and was killed by the SLURM cgroup at the requested limit.
+> 5. Alignment memory was modelled as `input_size x 5`, but bowtie2's footprint is
+>    dominated by the resident index and is essentially flat in sample size — so
+>    large samples were under-provisioned and OOM-killed.
+> 6. `bowtie2 -p N` plus `samtools --threads 4` twice requested more threads than
+>    the allocation had.
+> 7. No record of tool versions, so v1.0 outputs cannot be tied to specific builds.
+>
+> v2.0 fixes all seven. Outputs are written as **dated shards**
+> (`depth_matrix_YYYYMMDD.csv`) and merged into the canonical matrix, so a
+> backfill never rewrites samples that are already done.
+
+
 A Snakemake pipeline that processes shotgun metagenomic data from raw SRA accessions to per-species coverage matrices on any SLURM cluster. Built for investigating bacterial evolutionary dynamics across human populations.
 
 ## What You Provide
