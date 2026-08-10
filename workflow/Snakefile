@@ -346,7 +346,10 @@ rule sra_download:
             fi
 
             pigz -p {threads} "$TMP/${{RUN}}_1.fastq" "$TMP/${{RUN}}_2.fastq" 2>> "$WDIR/{log}"
-            rm -rf {params.sra_cache}/"$RUN" 2>> "$WDIR/{log}" || true
+            # Absolute path: we are inside the cache directory, so the relative
+            # form silently resolved to a path that never exists and left every
+            # downloaded .sra on disk.
+            rm -rf "$WDIR/{params.sra_cache}/$RUN" 2>> "$WDIR/{log}" || true
         done
 
         # Concatenate in the SAME order for both mates so pairing is preserved.
