@@ -24,12 +24,28 @@ SRA = re.compile(r"\b([SED]RR\d{6,})\b")
 
 
 def requested(path):
+    """Sample identifiers expected as matrix rows.
+
+    Must mirror `load_samples()` in the Snakefile exactly. For a two-column
+    `sample_id <TAB> run1;run2` file the matrix row is the SAMPLE, not its runs
+    -- checking for the runs would report every multi-run sample as missing
+    while flagging the (correct) sample rows as unexpected.
+    """
     ids, seen = [], set()
     with open(path) as fh:
         for line in fh:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
+            if re.match(r"^sample[_ ]?id\b", line, re.IGNORECASE):
+                continue
+            parts = re.split(r"[\t,]", line, maxsplit=1)
+            if len(parts) == 2 and SRA.search(parts[1]):
+                sid = parts[0].strip()
+                if sid and sid not in seen:
+                    ids.append(sid)
+                    seen.add(sid)
+                    continue
             for m in SRA.findall(line):
                 if m not in seen:
                     ids.append(m)

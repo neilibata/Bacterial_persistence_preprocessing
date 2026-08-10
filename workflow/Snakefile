@@ -89,32 +89,59 @@ def checkpoint(path, keep_flag):
 # =========================================================================
 # Sample discovery
 # =========================================================================
-# Auto-detects SRA accessions (SRR*, ERR*, DRR*) from ANY file format:
-#   - One accession per line
-#   - Tab/space-delimited with accession in any column
-#   - Metadata tables with headers
-#   - Lines starting with # are ignored
+# Two file formats are accepted, detected per line:
+#
+#   1. sample_id <TAB> run1;run2;run3      explicit sample -> runs mapping
+#   2. anything containing accessions      each accession is its own sample
+#
+# Format 2 is the original behaviour and still works unchanged. Format 1 exists
+# because a biological sample is frequently sequenced across several SRA runs
+# (16% of this cohort; up to 35 runs for one sample). Those runs must be
+# concatenated BEFORE alignment: aligning them separately produces one matrix
+# row per run, and the analysis keys on one row per sample. The merge cannot be
+# done afterwards -- breadth is a percentage of genome covered, so per-run
+# breadths cannot be pooled without the underlying alignments.
+#
+# Lines starting with # and a `sample_id` header line are ignored.
 # =========================================================================
 SAMPLES_TSV = config["samples_tsv"]
 SRA_PATTERN = re.compile(r'\b([SED]RR\d{6,})\b')
 
 def load_samples():
-    """Scan the samples file for SRA accession IDs in any format."""
-    accessions = []
-    seen = set()
+    """Parse the samples file into an ordered {sample_id: [run, ...]} map."""
+    samples = {}
     with open(SAMPLES_TSV) as fh:
         for line in fh:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
+            if re.match(r'^sample[_ ]?id\b', line, re.IGNORECASE):
+                continue                                   # header row
+            parts = re.split(r'[\t,]', line, maxsplit=1)
+            if len(parts) == 2 and SRA_PATTERN.search(parts[1]):
+                sid = parts[0].strip()
+                runs = SRA_PATTERN.findall(parts[1])
+                if sid and runs:
+                    samples.setdefault(sid, runs)
+                    continue
+            # Fall back: every accession on the line is a single-run sample.
             for match in SRA_PATTERN.findall(line):
-                if match not in seen:
-                    accessions.append(match)
-                    seen.add(match)
-    return accessions
+                samples.setdefault(match, [match])
+    return samples
 
-SAMPLES = load_samples()
+SAMPLE_RUNS = load_samples()
+SAMPLES     = list(SAMPLE_RUNS)
+_N_MULTI    = sum(1 for r in SAMPLE_RUNS.values() if len(r) > 1)
+_N_RUNS     = sum(len(r) for r in SAMPLE_RUNS.values())
 print(f"[Pipeline] {len(SAMPLES)} samples auto-detected from {SAMPLES_TSV}")
+if _N_MULTI:
+    print(f"[Pipeline] {_N_MULTI} are multi-run; {_N_RUNS} runs will be "
+          f"downloaded and concatenated per sample")
+
+# Sample IDs are not always accessions (e.g. "FAT_006-22-0-0"), so constrain the
+# wildcard to the known set rather than letting it match greedily into suffixes.
+wildcard_constraints:
+    sample = "|".join(re.escape(s) for s in SAMPLES) if SAMPLES else r"[^/]+",
 
 
 # =========================================================================
@@ -265,7 +292,11 @@ rule build_metagenome_index:
 # =========================================================================
 
 rule sra_download:
-    """Download one paired-end sample from NCBI SRA."""
+    """Download every run belonging to a sample and concatenate them.
+
+    Single-run samples take the same path with a one-element loop, so this is
+    behaviourally identical to the previous per-accession rule for them.
+    """
     output:
         r1 = intermediate(f"{FASTQ_DIR}/{{sample}}_1.fastq.gz"),
         r2 = intermediate(f"{FASTQ_DIR}/{{sample}}_2.fastq.gz"),
@@ -273,11 +304,16 @@ rule sra_download:
         sra_cache = f"{RESULTS}/.sra_cache",
         fastq_dir = FASTQ_DIR,
         max_size  = config.get("prefetch_max_size", "300G"),
+        runs      = lambda wc: " ".join(SAMPLE_RUNS[wc.sample]),
+        n_runs    = lambda wc: len(SAMPLE_RUNS[wc.sample]),
     threads: 6
     retries: 2
     resources:
         mem_mb    = lambda wc, attempt: 10000 * attempt,
-        runtime   = lambda wc, attempt: 300 * attempt,
+        # Download+convert+compress is roughly linear in run count, so a sample
+        # with 10 runs needs far more than the 5 h a single run does.
+        runtime   = lambda wc, attempt: max(
+                        300, 120 * len(SAMPLE_RUNS[wc.sample])) * attempt,
         slurm_partition = PART_DOWNLOAD,
     log: "logs/01_download/{sample}.log"
     shell:
@@ -285,32 +321,51 @@ rule sra_download:
         set -euo pipefail
         WDIR=$(pwd)
         mkdir -p {params.sra_cache} {params.fastq_dir} "$(dirname "$WDIR/{log}")"
+        TMP="$WDIR/{params.fastq_dir}/.tmp_{wildcards.sample}"
+        rm -rf "$TMP"; mkdir -p "$TMP"
+
+        echo "=== {wildcards.sample}: {params.n_runs} run(s) ===" > "$WDIR/{log}"
+        echo "runs: {params.runs}" >> "$WDIR/{log}"
+
         cd {params.sra_cache}
+        for RUN in {params.runs}; do
+            echo "--- $RUN ---" >> "$WDIR/{log}"
 
-        echo "=== Downloading {wildcards.sample} ===" > "$WDIR/{log}"
+            # prefetch caches the .sra and resumes on retry
+            prefetch --max-size {params.max_size} "$RUN" 2>> "$WDIR/{log}"
+            fasterq-dump "$RUN" \
+                --split-files --progress --threads {threads} \
+                --outdir "$TMP" 2>> "$WDIR/{log}"
 
-        # prefetch (caches .sra, supports resume on retry)
-        prefetch --max-size {params.max_size} {wildcards.sample} 2>> "$WDIR/{log}"
+            # Both mates are required. A single-end run here would desynchronise
+            # R1/R2 for every subsequent run in the concatenation, silently
+            # corrupting the sample, so fail loudly instead.
+            if [ ! -f "$TMP/${{RUN}}_1.fastq" ] || [ ! -f "$TMP/${{RUN}}_2.fastq" ]; then
+                echo "ERROR: $RUN did not yield paired _1/_2 output" >> "$WDIR/{log}"
+                exit 1
+            fi
 
-        # fasterq-dump (converts .sra → paired .fastq)
-        fasterq-dump {wildcards.sample} \
-            --split-files --progress --threads {threads} \
-            --outdir "$WDIR/{params.fastq_dir}" \
-            2>> "$WDIR/{log}"
-
-        # Compress with pigz (parallel gzip)
-        for f in "$WDIR/{params.fastq_dir}/{wildcards.sample}"{{,_1,_2}}.fastq; do
-            [ -f "$f" ] && pigz -p {threads} "$f" 2>> "$WDIR/{log}" || true
+            pigz -p {threads} "$TMP/${{RUN}}_1.fastq" "$TMP/${{RUN}}_2.fastq" 2>> "$WDIR/{log}"
+            rm -rf {params.sra_cache}/"$RUN" 2>> "$WDIR/{log}" || true
         done
 
-        # Clean up cached .sra
-        rm -rf {params.sra_cache}/{wildcards.sample} 2>> "$WDIR/{log}" || true
+        # Concatenate in the SAME order for both mates so pairing is preserved.
+        # gzip members concatenate losslessly, so no decompression is needed.
+        cd "$WDIR"
+        : > "{output.r1}.part"
+        : > "{output.r2}.part"
+        for RUN in {params.runs}; do
+            cat "$TMP/${{RUN}}_1.fastq.gz" >> "{output.r1}.part"
+            cat "$TMP/${{RUN}}_2.fastq.gz" >> "{output.r2}.part"
+        done
+        mv "{output.r1}.part" "{output.r1}"
+        mv "{output.r2}.part" "{output.r2}"
+        rm -rf "$TMP"
 
-        # Verify paired outputs
-        [ -f "$WDIR/{output.r1}" ] && [ -f "$WDIR/{output.r2}" ] || \
-            {{ echo "ERROR: paired outputs missing for {wildcards.sample}" >> "$WDIR/{log}"; exit 1; }}
+        [ -s "{output.r1}" ] && [ -s "{output.r2}" ] || \
+            {{ echo "ERROR: empty output for {wildcards.sample}" >> "{log}"; exit 1; }}
 
-        echo "=== Done {wildcards.sample} ===" >> "$WDIR/{log}"
+        echo "=== Done {wildcards.sample} ===" >> "{log}"
         """
 
 

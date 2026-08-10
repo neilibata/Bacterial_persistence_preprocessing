@@ -37,11 +37,46 @@ A Snakemake pipeline that processes shotgun metagenomic data from raw SRA access
 
 | File | Description |
 |---|---|
-| `resources/samples.tsv` | SRA accessions (one per line): SRR, ERR, or DRR IDs |
+| `resources/samples.tsv` | Sample list — see **Sample list formats** below |
 | `resources/reference_metagenome.fna` | Your metagenome reference FASTA (e.g. UHGG subset) |
 | `resources/contig_to_species.tsv` | Mapping: `species_id <TAB> contig_name <TAB> length` |
 
 Everything else — downloading PhiX/hg38 genomes, building all Bowtie2 indices, QC, alignment, filtering, coverage extraction, aggregation, and matrix combination — runs automatically.
+
+### Sample list formats
+
+**One accession per line** — each accession is treated as its own sample:
+
+```
+ERR7745335
+SRR25477699
+```
+
+**`sample_id <TAB> run1;run2;…`** — for samples sequenced across several runs:
+
+```
+sample_id	runs
+FAT_006-22-0-0	ERR1297836;ERR1297797;ERR1297781;ERR1297773
+FAT_008-22-0-0	ERR1297645;ERR1297705
+```
+
+Both formats can be mixed in one file, and a `sample_id` header is optional.
+
+Use the second form whenever one biological sample has multiple runs. The runs
+are downloaded, checked for paired-end output, and **concatenated in listed
+order before trimming**, so the sample produces exactly one matrix row.
+
+This matters more than it looks. If multi-run samples are listed one-accession-
+per-line instead, the pipeline emits one matrix row *per run*, and those rows
+cannot be merged afterwards — breadth is a percentage of genome covered, so
+per-run breadths cannot be pooled without the original alignments. In this
+project 16% of samples are multi-run (up to 35 runs each), and getting this
+wrong for one reference catalogue cost 89 samples that had to be reprocessed
+from scratch.
+
+Any run that does not yield both `_1` and `_2` FASTQs aborts the sample rather
+than being silently dropped, since a missing mate would desynchronise the
+read pairing of every run concatenated after it.
 
 ## Quick Start
 
