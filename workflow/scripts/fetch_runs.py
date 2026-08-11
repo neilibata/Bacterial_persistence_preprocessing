@@ -198,6 +198,15 @@ def main() -> int:
     args = ap.parse_args()
 
     runs = [r for r in args.runs.replace(",", " ").split() if r]
+
+    # Absolute paths are mandatory: prefetch and fasterq-dump are run with
+    # cwd=tmpdir, so a relative --outdir resolves *inside* tmpdir and the output
+    # lands somewhere this script never looks. That produced a spurious
+    # "produced no FASTQ output" for a run that had downloaded fine.
+    args.outdir = args.outdir.resolve()
+    args.tmpdir = args.tmpdir.resolve()
+    args.qc_dir = args.qc_dir.resolve()
+
     args.outdir.mkdir(parents=True, exist_ok=True)
     args.qc_dir.mkdir(parents=True, exist_ok=True)
     if args.tmpdir.exists():
@@ -214,15 +223,23 @@ def main() -> int:
         log(f"--- {run} ---")
         order = ([fetch_from_ena, fetch_from_sra] if args.prefer == "ena"
                  else [fetch_from_sra, fetch_from_ena])
-        status, files = "error", []
+
+        # Try every source for PAIRED before concluding single-end. SRA stores
+        # some runs with each second mate zero-length, so it reports single-end
+        # for a run ENA holds as properly paired (ERR1913111). Stopping at the
+        # first "single" would discard real paired data.
+        status, files, seen = "error", [], []
         for fn in order:
             if fn is fetch_from_ena:
                 status, files = fetch_from_ena(run, args.tmpdir)
             else:
                 status, files = fetch_from_sra(run, args.tmpdir,
                                                args.threads, args.max_size)
-            if status in ("paired", "single"):
+            seen.append(status)
+            if status == "paired":
                 break
+        if status != "paired":
+            status = "single" if "single" in seen else "error"
 
         if status == "paired":
             kept.append((run, files))
