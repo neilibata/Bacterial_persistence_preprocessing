@@ -339,9 +339,17 @@ rule sra_download:
 
             # prefetch caches the .sra and resumes on retry
             prefetch --max-size {params.max_size} "$RUN" 2>> "$WDIR/{log}"
+            # --split-3, not --split-files. --split-files assigns reads to files
+            # by index, so a spot with an orphan mate lands in _1 with nothing in
+            # _2, leaving the two files unequal. That is harmless for a single
+            # run but fatal when concatenating: an imbalance in run 1 shifts
+            # every later run's mates out of register, and repair.sh then finds
+            # no proper pairs at all. --split-3 emits only properly paired spots
+            # to _1/_2 and sends orphans to a third file.
             fasterq-dump "$RUN" \
-                --split-files --progress --threads {threads} \
+                --split-3 --progress --threads {threads} \
                 --outdir "$TMP" 2>> "$WDIR/{log}"
+            rm -f "$TMP/${{RUN}}.fastq"        # orphan reads from --split-3
 
             # `Paired SRR List` is not reliably paired-only: a few runs come back
             # single-end. Excluding such a run from BOTH mates keeps R1 and R2
@@ -358,6 +366,18 @@ rule sra_download:
                 rm -f "$TMP/${{RUN}}.fastq"
                 rm -rf "$WDIR/{params.sra_cache}/$RUN" 2>> "$WDIR/{log}" || true
                 continue
+            fi
+
+            # Equal mate counts are what makes concatenation safe. Verify rather
+            # than assume: a mismatch here desynchronises every run appended
+            # after it, and the damage is invisible until repair.sh reports zero
+            # pairs several stages later.
+            L1=$(wc -l < "$TMP/${{RUN}}_1.fastq")
+            L2=$(wc -l < "$TMP/${{RUN}}_2.fastq")
+            if [ "$L1" -ne "$L2" ]; then
+                echo "ERROR: $RUN mate files differ ($((L1/4)) vs $((L2/4)) reads);" \
+                     "concatenating would desynchronise the sample" >> "$WDIR/{log}"
+                exit 1
             fi
 
             pigz -p {threads} "$TMP/${{RUN}}_1.fastq" "$TMP/${{RUN}}_2.fastq" 2>> "$WDIR/{log}"
@@ -527,6 +547,21 @@ rule repair_mates:
             outs={params.singles_tmp} \
             qin=33 \
             &> {log}
+
+        # If the mates were out of register, repair.sh classifies nearly every
+        # read as a singleton and the paired outputs come back as empty gzip
+        # members (~28 bytes). Deleting the singles file then destroys the
+        # evidence, and the sample proceeds to align nothing and aggregate to a
+        # row of zeros. Fail here instead, while the cause is still visible.
+        for f in {output.r1} {output.r2}; do
+            if [ "$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")" -lt 1000 ]; then
+                echo "ERROR: $f is empty after repair - mates were almost" \
+                     "certainly out of register. Singles retained for" \
+                     "diagnosis at {params.singles_tmp}" >> {log}
+                exit 1
+            fi
+        done
+
         # Remove singles file — empty for properly paired data
         rm -f {params.singles_tmp}
         """
