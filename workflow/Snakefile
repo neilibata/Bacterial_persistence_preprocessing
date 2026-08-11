@@ -292,18 +292,22 @@ rule build_metagenome_index:
 # =========================================================================
 
 rule sra_download:
-    """Download every run belonging to a sample and concatenate them.
+    """Fetch every run of a sample and concatenate the paired-end ones.
 
-    Single-run samples take the same path with a one-element loop, so this is
-    behaviourally identical to the previous per-accession rule for them.
+    Delegates to workflow/scripts/fetch_runs.py, which looks a run's layout up
+    in ENA rather than inferring it from which files fasterq-dump happened to
+    emit. That distinction matters: ERR1913111 is PAIRED in ENA with 16.5M
+    reads but comes back single-end through SRA's Normalized Format, and the
+    previous inline version silently dropped it -- along with every other run
+    of that sample -- producing an all-zero coverage row with no error.
     """
     output:
         r1 = intermediate(f"{FASTQ_DIR}/{{sample}}_1.fastq.gz"),
         r2 = intermediate(f"{FASTQ_DIR}/{{sample}}_2.fastq.gz"),
     params:
-        sra_cache = f"{RESULTS}/.sra_cache",
         fastq_dir = FASTQ_DIR,
         qc_dir    = f"{RESULTS}/qc",
+        prefer    = config.get("download_source", "sra"),
         max_size  = config.get("prefetch_max_size", "300G"),
         runs      = lambda wc: " ".join(SAMPLE_RUNS[wc.sample]),
         n_runs    = lambda wc: len(SAMPLE_RUNS[wc.sample]),
@@ -319,99 +323,17 @@ rule sra_download:
     log: "logs/01_download/{sample}.log"
     shell:
         """
-        set -euo pipefail
-        WDIR=$(pwd)
-        mkdir -p {params.sra_cache} {params.fastq_dir} "$(dirname "$WDIR/{log}")"
-        TMP="$WDIR/{params.fastq_dir}/.tmp_{wildcards.sample}"
-        rm -rf "$TMP"; mkdir -p "$TMP"
-
-        echo "=== {wildcards.sample}: {params.n_runs} run(s) ===" > "$WDIR/{log}"
-        echo "runs: {params.runs}" >> "$WDIR/{log}"
-
-        mkdir -p "$WDIR/{params.qc_dir}"
-        SKIPFILE="$WDIR/{params.qc_dir}/{wildcards.sample}.skipped_runs.tsv"
-        : > "$SKIPFILE"
-        KEPT=""
-
-        cd {params.sra_cache}
-        for RUN in {params.runs}; do
-            echo "--- $RUN ---" >> "$WDIR/{log}"
-
-            # prefetch caches the .sra and resumes on retry
-            prefetch --max-size {params.max_size} "$RUN" 2>> "$WDIR/{log}"
-            # --split-3, not --split-files. --split-files assigns reads to files
-            # by index, so a spot with an orphan mate lands in _1 with nothing in
-            # _2, leaving the two files unequal. That is harmless for a single
-            # run but fatal when concatenating: an imbalance in run 1 shifts
-            # every later run's mates out of register, and repair.sh then finds
-            # no proper pairs at all. --split-3 emits only properly paired spots
-            # to _1/_2 and sends orphans to a third file.
-            fasterq-dump "$RUN" \
-                --split-3 --progress --threads {threads} \
-                --outdir "$TMP" 2>> "$WDIR/{log}"
-            rm -f "$TMP/${{RUN}}.fastq"        # orphan reads from --split-3
-
-            # `Paired SRR List` is not reliably paired-only: a few runs come back
-            # single-end. Excluding such a run from BOTH mates keeps R1 and R2
-            # built from an identical run set, so pairing is preserved -- it is
-            # only including a run in one mate and not the other that would
-            # desynchronise them. Skip it, record it, and carry on.
-            if [ ! -f "$TMP/${{RUN}}_1.fastq" ] || [ ! -f "$TMP/${{RUN}}_2.fastq" ]; then
-                NREADS=$(wc -l < "$TMP/${{RUN}}.fastq" 2>/dev/null || echo 0)
-                NREADS=$(( NREADS / 4 ))
-                echo "SKIP: $RUN yielded no _1/_2 (single-end, ~${{NREADS}} reads);" \
-                     "excluded from both mates" >> "$WDIR/{log}"
-                printf '%s\t%s\tsingle_end_skipped\t%s\n' \
-                    "{wildcards.sample}" "$RUN" "$NREADS" >> "$SKIPFILE"
-                rm -f "$TMP/${{RUN}}.fastq"
-                rm -rf "$WDIR/{params.sra_cache}/$RUN" 2>> "$WDIR/{log}" || true
-                continue
-            fi
-
-            # Equal mate counts are what makes concatenation safe. Verify rather
-            # than assume: a mismatch here desynchronises every run appended
-            # after it, and the damage is invisible until repair.sh reports zero
-            # pairs several stages later.
-            L1=$(wc -l < "$TMP/${{RUN}}_1.fastq")
-            L2=$(wc -l < "$TMP/${{RUN}}_2.fastq")
-            if [ "$L1" -ne "$L2" ]; then
-                echo "ERROR: $RUN mate files differ ($((L1/4)) vs $((L2/4)) reads);" \
-                     "concatenating would desynchronise the sample" >> "$WDIR/{log}"
-                exit 1
-            fi
-
-            pigz -p {threads} "$TMP/${{RUN}}_1.fastq" "$TMP/${{RUN}}_2.fastq" 2>> "$WDIR/{log}"
-            KEPT="$KEPT $RUN"
-            # Absolute path: we are inside the cache directory, so the relative
-            # form silently resolved to a path that never exists and left every
-            # downloaded .sra on disk.
-            rm -rf "$WDIR/{params.sra_cache}/$RUN" 2>> "$WDIR/{log}" || true
-        done
-
-        # A sample with no paired-end run at all cannot be processed; that is a
-        # real failure rather than something to paper over.
-        if [ -z "$KEPT" ]; then
-            echo "ERROR: {wildcards.sample} has no paired-end runs" >> "$WDIR/{log}"
-            exit 1
-        fi
-
-        # Concatenate in the SAME order for both mates so pairing is preserved.
-        # gzip members concatenate losslessly, so no decompression is needed.
-        cd "$WDIR"
-        : > "{output.r1}.part"
-        : > "{output.r2}.part"
-        for RUN in $KEPT; do
-            cat "$TMP/${{RUN}}_1.fastq.gz" >> "{output.r1}.part"
-            cat "$TMP/${{RUN}}_2.fastq.gz" >> "{output.r2}.part"
-        done
-        mv "{output.r1}.part" "{output.r1}"
-        mv "{output.r2}.part" "{output.r2}"
-        rm -rf "$TMP"
-
-        [ -s "{output.r1}" ] && [ -s "{output.r2}" ] || \
-            {{ echo "ERROR: empty output for {wildcards.sample}" >> "{log}"; exit 1; }}
-
-        echo "=== Done {wildcards.sample} ===" >> "{log}"
+        mkdir -p "$(dirname {log})"
+        python workflow/scripts/fetch_runs.py \
+            --sample {wildcards.sample} \
+            --runs "{params.runs}" \
+            --outdir {params.fastq_dir} \
+            --tmpdir {params.fastq_dir}/.tmp_{wildcards.sample} \
+            --qc-dir {params.qc_dir} \
+            --threads {threads} \
+            --max-size {params.max_size} \
+            --prefer {params.prefer} \
+            &> {log}
         """
 
 

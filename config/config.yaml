@@ -35,6 +35,14 @@ max_jobs: 500
 mapq_threshold: 30
 prefetch_max_size: "300G"
 
+# Where reads come from: "sra" (prefetch+fasterq-dump) or "ena" (direct FASTQ).
+# SRA is the default because the published matrices were built that way, and
+# mixing sources within one cohort risks a batch effect -- SRA stores a
+# re-encoded "Normalized Format", ENA stores the submitter's original files.
+# Whichever is chosen, the other is used as a fallback, so a run that one
+# archive cannot deliver as paired-end is still recovered from the other.
+download_source: "sra"
+
 # Bowtie2 scales sub-linearly past ~16 threads, so more concurrent jobs beats
 # more threads per job. 6 of these go to the samtools pipe, not bowtie2.
 align_threads: 16
