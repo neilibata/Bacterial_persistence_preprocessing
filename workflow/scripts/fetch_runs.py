@@ -82,6 +82,17 @@ def md5sum(path: Path, chunk: int = 8 << 20) -> str:
     return h.hexdigest()
 
 
+def count_lines(path: Path) -> int:
+    """`wc -l`, falling back to Python only if wc is unavailable."""
+    try:
+        out = subprocess.run(["wc", "-l", str(path)],
+                             capture_output=True, text=True, check=True)
+        return int(out.stdout.split()[0])
+    except (OSError, subprocess.CalledProcessError, ValueError, IndexError):
+        with open(path, "rb") as fh:
+            return sum(1 for _ in fh)
+
+
 def curl(url: str, dest: Path) -> bool:
     """Fetch over HTTPS. ENA's paths are given host-relative."""
     if not url.startswith(("http://", "https://", "ftp://")):
@@ -161,8 +172,9 @@ def fetch_from_sra(run: str, tmp: Path, threads: int,
     shutil.rmtree(tmp / run, ignore_errors=True)
 
     if r1.exists() and r2.exists():
-        n1 = sum(1 for _ in open(r1, "rb"))
-        n2 = sum(1 for _ in open(r2, "rb"))
+        # `wc -l` in C, not a Python loop: these files run to tens of millions
+        # of lines and iterating them in Python stalls the job for minutes.
+        n1, n2 = count_lines(r1), count_lines(r2)
         if n1 != n2:
             log(f"    SRA: mate files differ ({n1 // 4} vs {n2 // 4} reads)")
             return "error", []
@@ -174,9 +186,11 @@ def fetch_from_sra(run: str, tmp: Path, threads: int,
         return "paired", [Path(f"{r1}.gz"), Path(f"{r2}.gz")]
 
     if orphan.exists():
-        n = sum(1 for _ in open(orphan, "rb")) // 4
+        # Size only -- the exact count is informational and not worth a full
+        # pass over a multi-gigabyte file we are about to delete.
+        gb = orphan.stat().st_size / 1e9
         orphan.unlink()
-        log(f"    SRA: single-end output ({n} reads)")
+        log(f"    SRA: single-end output ({gb:.1f} GB), no pairs")
         return "single", []
 
     log(f"    SRA: produced no FASTQ output for {run}")
