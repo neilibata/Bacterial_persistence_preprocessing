@@ -303,6 +303,7 @@ rule sra_download:
     params:
         sra_cache = f"{RESULTS}/.sra_cache",
         fastq_dir = FASTQ_DIR,
+        qc_dir    = f"{RESULTS}/qc",
         max_size  = config.get("prefetch_max_size", "300G"),
         runs      = lambda wc: " ".join(SAMPLE_RUNS[wc.sample]),
         n_runs    = lambda wc: len(SAMPLE_RUNS[wc.sample]),
@@ -327,6 +328,11 @@ rule sra_download:
         echo "=== {wildcards.sample}: {params.n_runs} run(s) ===" > "$WDIR/{log}"
         echo "runs: {params.runs}" >> "$WDIR/{log}"
 
+        mkdir -p "$WDIR/{params.qc_dir}"
+        SKIPFILE="$WDIR/{params.qc_dir}/{wildcards.sample}.skipped_runs.tsv"
+        : > "$SKIPFILE"
+        KEPT=""
+
         cd {params.sra_cache}
         for RUN in {params.runs}; do
             echo "--- $RUN ---" >> "$WDIR/{log}"
@@ -337,27 +343,44 @@ rule sra_download:
                 --split-files --progress --threads {threads} \
                 --outdir "$TMP" 2>> "$WDIR/{log}"
 
-            # Both mates are required. A single-end run here would desynchronise
-            # R1/R2 for every subsequent run in the concatenation, silently
-            # corrupting the sample, so fail loudly instead.
+            # `Paired SRR List` is not reliably paired-only: a few runs come back
+            # single-end. Excluding such a run from BOTH mates keeps R1 and R2
+            # built from an identical run set, so pairing is preserved -- it is
+            # only including a run in one mate and not the other that would
+            # desynchronise them. Skip it, record it, and carry on.
             if [ ! -f "$TMP/${{RUN}}_1.fastq" ] || [ ! -f "$TMP/${{RUN}}_2.fastq" ]; then
-                echo "ERROR: $RUN did not yield paired _1/_2 output" >> "$WDIR/{log}"
-                exit 1
+                NREADS=$(wc -l < "$TMP/${{RUN}}.fastq" 2>/dev/null || echo 0)
+                NREADS=$(( NREADS / 4 ))
+                echo "SKIP: $RUN yielded no _1/_2 (single-end, ~${{NREADS}} reads);" \
+                     "excluded from both mates" >> "$WDIR/{log}"
+                printf '%s\t%s\tsingle_end_skipped\t%s\n' \
+                    "{wildcards.sample}" "$RUN" "$NREADS" >> "$SKIPFILE"
+                rm -f "$TMP/${{RUN}}.fastq"
+                rm -rf "$WDIR/{params.sra_cache}/$RUN" 2>> "$WDIR/{log}" || true
+                continue
             fi
 
             pigz -p {threads} "$TMP/${{RUN}}_1.fastq" "$TMP/${{RUN}}_2.fastq" 2>> "$WDIR/{log}"
+            KEPT="$KEPT $RUN"
             # Absolute path: we are inside the cache directory, so the relative
             # form silently resolved to a path that never exists and left every
             # downloaded .sra on disk.
             rm -rf "$WDIR/{params.sra_cache}/$RUN" 2>> "$WDIR/{log}" || true
         done
 
+        # A sample with no paired-end run at all cannot be processed; that is a
+        # real failure rather than something to paper over.
+        if [ -z "$KEPT" ]; then
+            echo "ERROR: {wildcards.sample} has no paired-end runs" >> "$WDIR/{log}"
+            exit 1
+        fi
+
         # Concatenate in the SAME order for both mates so pairing is preserved.
         # gzip members concatenate losslessly, so no decompression is needed.
         cd "$WDIR"
         : > "{output.r1}.part"
         : > "{output.r2}.part"
-        for RUN in {params.runs}; do
+        for RUN in $KEPT; do
             cat "$TMP/${{RUN}}_1.fastq.gz" >> "{output.r1}.part"
             cat "$TMP/${{RUN}}_2.fastq.gz" >> "{output.r2}.part"
         done
