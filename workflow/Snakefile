@@ -129,6 +129,42 @@ def load_samples():
                 samples.setdefault(match, [match])
     return samples
 
+def validate_contig_map(path):
+    """Fail fast if the map's species column is actually contig-level.
+
+    `aggregate_coverage.py` treats column 1 as the species and column 2 as the
+    contig. A map whose column 1 carries contig identifiers parses without
+    error and produces a matrix with one column per contig instead of per
+    species -- 251,424 columns rather than 3,971 in the case that prompted this
+    check. Nothing downstream notices; the matrix is simply the wrong shape,
+    and it is only caught when someone compares it to a matrix built correctly.
+
+    The signature is unmistakable: a species column with nearly as many
+    distinct values as the contig column.
+    """
+    species, contigs, rows = set(), set(), 0
+    with open(path) as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                parts = line.split()
+            if len(parts) < 3:
+                continue
+            species.add(parts[0]); contigs.add(parts[1]); rows += 1
+    if not rows:
+        raise WorkflowError(f"contig map {path} contains no usable rows")
+    ratio = len(species) / len(contigs)
+    print(f"[Pipeline] contig map: {len(species):,} species over "
+          f"{len(contigs):,} contigs ({rows:,} rows)")
+    if ratio > 0.5:
+        raise WorkflowError(
+            f"contig map {path} looks contig-level, not species-level: "
+            f"{len(species):,} distinct values in the species column against "
+            f"{len(contigs):,} contigs. Column 1 must be the species/SGB "
+            f"identifier and column 2 the contig.")
+
+validate_contig_map(config["contig_to_species"])
+
 SAMPLE_RUNS = load_samples()
 SAMPLES     = list(SAMPLE_RUNS)
 _N_MULTI    = sum(1 for r in SAMPLE_RUNS.values() if len(r) > 1)
