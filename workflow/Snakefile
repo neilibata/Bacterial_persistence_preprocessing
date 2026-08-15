@@ -232,6 +232,17 @@ def ref_dir(base):
     single-reference result trees resume unchanged."""
     return f"{base}/{{ref}}" if MULTI_REF else base
 
+def ref_log(path):
+    """Log path for a per-reference rule.
+
+    Snakemake requires every output, log and benchmark of a rule to carry the
+    same wildcards, so a rule whose outputs gained {ref} must have it in the
+    log too -- otherwise two references would write to one log and the rule is
+    rejected at DAG construction.
+    """
+    return f"logs/{{ref}}/{path}" if MULTI_REF else f"logs/{path}"
+
+
 def ref_tag(name):
     """Filename component for a reference; empty in single-reference mode."""
     return f"_{name}" if MULTI_REF else ""
@@ -398,7 +409,7 @@ rule build_metagenome_index:
         mem_mb    = 65000,
         runtime   = 300,
         slurm_partition = PART_CPU,
-    log: "logs/ref/build_metagenome.log"
+    log: ref_log("ref/build_metagenome.log")
     shell:
         """
         mkdir -p $(dirname {params.idx})
@@ -639,7 +650,7 @@ rule align:
         mem_mb    = align_mem,
         runtime   = lambda wc, input, attempt: max(180,   int(input.size_mb / 12)) * attempt,
         slurm_partition = part_by_size,
-    log: "logs/03_align/{sample}.log"
+    log: ref_log("03_align/{sample}.log")
     shell:
         # Pipe: bowtie2 → samtools view → samtools sort
         # samtools gets 4 threads each; bowtie2 gets the rest
@@ -688,7 +699,7 @@ rule filter_mapq:
         mem_mb    = lambda wc, input, attempt: max(8000, int(input.size_mb * 1.5)) * attempt,
         runtime   = lambda wc, input, attempt: max(30,   int(input.size_mb / 200)) * attempt,
         slurm_partition = PART_SHARED,
-    log: "logs/04_filter/{sample}.log"
+    log: ref_log("04_filter/{sample}.log")
     shell:
         """
         mkdir -p $(dirname {output.high}) $(dirname {output.low})
@@ -721,7 +732,7 @@ rule extract_coverage:
         mem_mb    = lambda wc, input, attempt: max(4000, int(input.size_mb * 1.5)) * attempt,
         runtime   = lambda wc, input, attempt: max(30,   int(input.size_mb / 100)) * attempt,
         slurm_partition = PART_SHARED,
-    log: "logs/05_coverage/{tier}/{sample}.log"
+    log: ref_log("05_coverage/{tier}/{sample}.log")
     shell:
         """
         mkdir -p $(dirname {output.cov})
@@ -752,7 +763,7 @@ rule aggregate_coverage:
         mem_mb    = 16000,
         runtime   = 60,
         slurm_partition = PART_SHARED,
-    log: "logs/06_aggregate/{sample}.log"
+    log: ref_log("06_aggregate/{sample}.log")
     shell:
         """
         mkdir -p {params.output_dir}
@@ -795,7 +806,7 @@ rule combine_matrices:
         mem_mb         = 32000,
         runtime        = 120,
         slurm_partition = PART_SHARED,
-    log: "logs/07_combine/combine_matrices.log"
+    log: ref_log("07_combine/combine_matrices.log")
     shell:
         """
         python workflow/scripts/combine_aggregated_stats.py \
@@ -827,7 +838,7 @@ rule verify_completeness:
         mem_mb          = 4000,
         runtime         = 15,
         slurm_partition = PART_SHARED,
-    log: "logs/08_verify/completeness.log"
+    log: ref_log("08_verify/completeness.log")
     shell:
         """
         python workflow/scripts/verify_completeness.py \
@@ -859,7 +870,7 @@ rule merge_matrix_shards:
         mem_mb          = 8000,
         runtime         = 60,
         slurm_partition = PART_SHARED,
-    log: "logs/09_merge/merge.log"
+    log: ref_log("09_merge/merge.log")
     shell:
         """
         python workflow/scripts/merge_matrix_shards.py \\
