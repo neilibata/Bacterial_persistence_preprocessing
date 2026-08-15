@@ -163,7 +163,86 @@ def validate_contig_map(path):
             f"{len(contigs):,} contigs. Column 1 must be the species/SGB "
             f"identifier and column 2 the contig.")
 
-validate_contig_map(config["contig_to_species"])
+# =========================================================================
+# Reference catalogues
+# =========================================================================
+# One reference (legacy) or several (multi-reference mode).
+#
+#   reference_fasta:   resources/ref.fna          # legacy, unchanged
+#   contig_to_species: resources/contig.tsv
+#
+#   references:                                    # multi-reference mode
+#     UHGG: {fasta: resources/uhgg.fna, contig_to_species: resources/uhgg.tsv}
+#     lev:  {fasta: resources/lev.fna,  contig_to_species: resources/lev.tsv}
+#
+# Everything upstream of alignment -- download, trim, PhiX, host removal,
+# repair -- is reference-independent and is the bulk of the runtime. Running it
+# once per reference repeats that work for no gain. In multi-reference mode the
+# shared stages run once and each reference consumes the same repaired FASTQs.
+#
+# The repaired reads are released only after the LAST reference has aligned
+# them: Snakemake's temp() deletes a file when no pending job still needs it,
+# so `keep_repaired_reads: false` gives exactly the requested behaviour --
+# align against every reference, then delete -- with no extra bookkeeping.
+# =========================================================================
+if config.get("references"):
+    REFERENCES = {str(k): dict(v) for k, v in config["references"].items()}
+    MULTI_REF  = True
+
+    # Run a subset without editing the reference table:
+    #     --config only_refs=UHGG
+    #     --config only_refs=UHGG,lev
+    # The per-reference directory layout is KEPT when subsetting, so a later run
+    # of the other reference lands beside the first instead of colliding with
+    # it. Selecting a subset is a scheduling decision, not a layout change --
+    # dropping to the legacy flat layout here would mean the second reference
+    # overwrote the first's matrices.
+    _only = config.get("only_refs") or config.get("only_ref")
+    if _only:
+        if isinstance(_only, str):
+            _wanted = [x.strip() for x in _only.replace(";", ",").split(",") if x.strip()]
+        else:
+            _wanted = [str(x) for x in _only]
+        _unknown = [r for r in _wanted if r not in REFERENCES]
+        if _unknown:
+            raise WorkflowError(
+                f"only_refs names {_unknown} which are not in the references "
+                f"table (have: {sorted(REFERENCES)})")
+        REFERENCES = {k: v for k, v in REFERENCES.items() if k in _wanted}
+        if not REFERENCES:
+            raise WorkflowError("only_refs selected no references")
+else:
+    REFERENCES = {"__single__": {
+        "fasta":             config["reference_fasta"],
+        "contig_to_species": config["contig_to_species"],
+    }}
+    MULTI_REF = False
+
+REF_NAMES = list(REFERENCES)
+print(f"[Pipeline] references: {', '.join(REF_NAMES)}"
+      + ("" if MULTI_REF else "  (legacy single-reference layout)"))
+for _name, _spec in REFERENCES.items():
+    if "fasta" not in _spec or "contig_to_species" not in _spec:
+        raise WorkflowError(
+            f"reference {_name!r} needs both 'fasta' and 'contig_to_species'")
+    validate_contig_map(_spec["contig_to_species"])
+
+def ref_dir(base):
+    """Insert a per-reference level only in multi-reference mode, so existing
+    single-reference result trees resume unchanged."""
+    return f"{base}/{{ref}}" if MULTI_REF else base
+
+def ref_tag(name):
+    """Filename component for a reference; empty in single-reference mode."""
+    return f"_{name}" if MULTI_REF else ""
+
+def contig_map_for(wildcards):
+    name = getattr(wildcards, "ref", None) or REF_NAMES[0]
+    return REFERENCES[name]["contig_to_species"]
+
+def fasta_for(wildcards):
+    name = getattr(wildcards, "ref", None) or REF_NAMES[0]
+    return REFERENCES[name]["fasta"]
 
 SAMPLE_RUNS = load_samples()
 SAMPLES     = list(SAMPLE_RUNS)
@@ -178,6 +257,7 @@ if _N_MULTI:
 # wildcard to the known set rather than letting it match greedily into suffixes.
 wildcard_constraints:
     sample = "|".join(re.escape(s) for s in SAMPLES) if SAMPLES else r"[^/]+",
+    ref    = "|".join(re.escape(r) for r in REF_NAMES),
 
 
 # =========================================================================
@@ -195,27 +275,37 @@ REF_DIR   = f"{RESULTS}/references"
 FASTQ_DIR = f"{RESULTS}/fastq"
 PHIX_IDX  = f"{REF_DIR}/phix/phix"
 HUMAN_IDX = f"{REF_DIR}/human/hg38"
-META_IDX  = f"{REF_DIR}/metagenome/reference"
+META_IDX  = (f"{REF_DIR}/metagenome/{{ref}}/reference" if MULTI_REF
+             else f"{REF_DIR}/metagenome/reference")
+META_SENT = (f"{REF_DIR}/metagenome/{{ref}}/.index_done" if MULTI_REF
+             else f"{REF_DIR}/metagenome/.index_done")
 
 
 # =========================================================================
 # TARGET — the final outputs
 # =========================================================================
+def _targets():
+    """Final outputs, once per configured reference."""
+    out = []
+    for ref in REF_NAMES:
+        agg  = f"{RESULTS}/aggregated/{ref}" if MULTI_REF else f"{RESULTS}/aggregated"
+        mat  = f"{RESULTS}/matrices/{ref}"   if MULTI_REF else f"{RESULTS}/matrices"
+        out += expand(f"{agg}/{{sample}}_depth_and_coverage_stats.csv",
+                      sample=SAMPLES)
+        out += [
+            f"{mat}/depth_matrix_{MATRIX_VERSION}.csv",
+            f"{mat}/coverage_matrix_{MATRIX_VERSION}.csv",
+            f"{mat}/depth_matrix.csv",
+            f"{mat}/coverage_matrix.csv",
+            f"{mat}/completeness_report.tsv",
+        ]
+    out += [f"{RESULTS}/provenance/software_versions_{MATRIX_VERSION}.txt"]
+    return out
+
+
 rule all:
     input:
-        # Per-sample CSVs
-        expand(f"{RESULTS}/aggregated/{{sample}}_depth_and_coverage_stats.csv",
-               sample=SAMPLES),
-        # This run's dated shard
-        f"{RESULTS}/matrices/depth_matrix_{MATRIX_VERSION}.csv",
-        f"{RESULTS}/matrices/coverage_matrix_{MATRIX_VERSION}.csv",
-        # Canonical matrices, merged from every shard present
-        f"{RESULTS}/matrices/depth_matrix.csv",
-        f"{RESULTS}/matrices/coverage_matrix.csv",
-        # Completeness proof for the samples THIS run was asked to produce
-        f"{RESULTS}/matrices/completeness_report.tsv",
-        # What produced these outputs
-        f"{RESULTS}/provenance/software_versions_{MATRIX_VERSION}.txt",
+        _targets(),
 
 
 # =========================================================================
@@ -299,9 +389,9 @@ rule build_human_index:
 
 
 rule build_metagenome_index:
-    """Build Bowtie2 large index from your reference metagenome FASTA."""
-    input:  fasta = config["reference_fasta"]
-    output: sentinel = f"{REF_DIR}/metagenome/.index_done"
+    """Build a Bowtie2 large index per reference catalogue."""
+    input:  fasta = fasta_for
+    output: sentinel = META_SENT
     params: idx = META_IDX
     threads: 8
     resources:
@@ -537,10 +627,10 @@ rule align:
     input:
         r1       = f"{RESULTS}/repaired/{{sample}}_1_repaired.fq.gz",
         r2       = f"{RESULTS}/repaired/{{sample}}_2_repaired.fq.gz",
-        idx_done = f"{REF_DIR}/metagenome/.index_done",
+        idx_done = META_SENT,
     output:
-        bam = intermediate(f"{RESULTS}/aligned/{{sample}}.sorted.bam"),
-        bai = intermediate(f"{RESULTS}/aligned/{{sample}}.sorted.bam.bai"),
+        bam = intermediate(f"{ref_dir(RESULTS + '/aligned')}/{{sample}}.sorted.bam"),
+        bai = intermediate(f"{ref_dir(RESULTS + '/aligned')}/{{sample}}.sorted.bam.bai"),
     params:
         idx = META_IDX,
     threads: ALIGN_THREADS
@@ -586,10 +676,10 @@ rule align:
 rule filter_mapq:
     """Single-pass BAM split into high/low MAPQ."""
     input:
-        bam = f"{RESULTS}/aligned/{{sample}}.sorted.bam",
+        bam = f"{ref_dir(RESULTS + '/aligned')}/{{sample}}.sorted.bam",
     output:
-        high = checkpoint(f"{RESULTS}/filtered/high/{{sample}}_high_mapq.bam", KEEP_FILTERED_BAMS),
-        low  = checkpoint(f"{RESULTS}/filtered/low/{{sample}}_low_mapq.bam", KEEP_FILTERED_BAMS),
+        high = checkpoint(f"{ref_dir(RESULTS + '/filtered')}/high/{{sample}}_high_mapq.bam", KEEP_FILTERED_BAMS),
+        low  = checkpoint(f"{ref_dir(RESULTS + '/filtered')}/low/{{sample}}_low_mapq.bam", KEEP_FILTERED_BAMS),
     params:
         mapq = config.get("mapq_threshold", 30),
     threads: 4
@@ -622,9 +712,9 @@ rule filter_mapq:
 rule extract_coverage:
     """Per-contig coverage statistics with samtools coverage."""
     input:
-        bam = f"{RESULTS}/filtered/{{tier}}/{{sample}}_{{tier}}_mapq.bam",
+        bam = f"{ref_dir(RESULTS + '/filtered')}/{{tier}}/{{sample}}_{{tier}}_mapq.bam",
     output:
-        cov = f"{RESULTS}/coverage/{{tier}}/{{sample}}_{{tier}}_mapq_coverage.txt",
+        cov = f"{ref_dir(RESULTS + '/coverage')}/{{tier}}/{{sample}}_{{tier}}_mapq_coverage.txt",
     threads: 1
     retries: 2
     resources:
@@ -650,13 +740,13 @@ rule extract_coverage:
 rule aggregate_coverage:
     """Aggregate per-contig coverage to per-species weighted statistics."""
     input:
-        cov = f"{RESULTS}/coverage/high/{{sample}}_high_mapq_coverage.txt",
+        cov = f"{ref_dir(RESULTS + '/coverage')}/high/{{sample}}_high_mapq_coverage.txt",
     output:
-        csv = f"{RESULTS}/aggregated/{{sample}}_depth_and_coverage_stats.csv",
+        csv = f"{ref_dir(RESULTS + '/aggregated')}/{{sample}}_depth_and_coverage_stats.csv",
     params:
-        contig_map = config["contig_to_species"],
-        input_dir  = f"{RESULTS}/coverage/high",
-        output_dir = f"{RESULTS}/aggregated",
+        contig_map = contig_map_for,
+        input_dir  = f"{ref_dir(RESULTS + '/coverage')}/high",
+        output_dir = ref_dir(RESULTS + "/aggregated"),
     threads: 1
     resources:
         mem_mb    = 16000,
@@ -689,15 +779,16 @@ rule aggregate_coverage:
 rule combine_matrices:
     """Combine all per-sample CSVs into sample × species matrices."""
     input:
-        csvs = expand(f"{RESULTS}/aggregated/{{sample}}_depth_and_coverage_stats.csv",
-                       sample=SAMPLES),
+        csvs = lambda wc: expand(
+            f"{ref_dir(RESULTS + '/aggregated')}/{{sample}}_depth_and_coverage_stats.csv",
+            sample=SAMPLES, **({"ref": wc.ref} if MULTI_REF else {})),
     output:
-        depth    = f"{RESULTS}/matrices/depth_matrix_{MATRIX_VERSION}.csv",
-        coverage = f"{RESULTS}/matrices/coverage_matrix_{MATRIX_VERSION}.csv",
+        depth    = f"{ref_dir(RESULTS + '/matrices')}/depth_matrix_{MATRIX_VERSION}.csv",
+        coverage = f"{ref_dir(RESULTS + '/matrices')}/coverage_matrix_{MATRIX_VERSION}.csv",
     params:
-        agg_dir    = f"{RESULTS}/aggregated",
-        contig_map = config["contig_to_species"],
-        out_dir    = f"{RESULTS}/matrices",
+        agg_dir    = ref_dir(RESULTS + "/aggregated"),
+        contig_map = contig_map_for,
+        out_dir    = ref_dir(RESULTS + "/matrices"),
         version    = MATRIX_VERSION,
     threads: 1
     resources:
@@ -727,10 +818,10 @@ rule combine_matrices:
 rule verify_completeness:
     """Fail the run if any requested accession is missing from the matrix."""
     input:
-        matrix  = f"{RESULTS}/matrices/depth_matrix_{MATRIX_VERSION}.csv",
+        matrix  = f"{ref_dir(RESULTS + '/matrices')}/depth_matrix_{MATRIX_VERSION}.csv",
         samples = SAMPLES_TSV,
     output:
-        report = f"{RESULTS}/matrices/completeness_report.tsv",
+        report = f"{ref_dir(RESULTS + '/matrices')}/completeness_report.tsv",
     threads: 1
     resources:
         mem_mb          = 4000,
@@ -756,13 +847,13 @@ rule verify_completeness:
 rule merge_matrix_shards:
     """Concatenate all dated shards into the canonical matrices."""
     input:
-        depth_shard = f"{RESULTS}/matrices/depth_matrix_{MATRIX_VERSION}.csv",
-        cov_shard   = f"{RESULTS}/matrices/coverage_matrix_{MATRIX_VERSION}.csv",
+        depth_shard = f"{ref_dir(RESULTS + '/matrices')}/depth_matrix_{MATRIX_VERSION}.csv",
+        cov_shard   = f"{ref_dir(RESULTS + '/matrices')}/coverage_matrix_{MATRIX_VERSION}.csv",
     output:
-        depth    = f"{RESULTS}/matrices/depth_matrix.csv",
-        coverage = f"{RESULTS}/matrices/coverage_matrix.csv",
+        depth    = f"{ref_dir(RESULTS + '/matrices')}/depth_matrix.csv",
+        coverage = f"{ref_dir(RESULTS + '/matrices')}/coverage_matrix.csv",
     params:
-        mdir = f"{RESULTS}/matrices",
+        mdir = ref_dir(RESULTS + "/matrices"),
     threads: 1
     resources:
         mem_mb          = 8000,
