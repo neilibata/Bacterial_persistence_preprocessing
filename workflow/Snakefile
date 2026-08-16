@@ -468,12 +468,19 @@ rule sra_download:
         mem_mb    = lambda wc, attempt: 10000 * attempt,
         # Download+convert+compress is roughly linear in run count, so a sample
         # with 10 runs needs far more than the 5 h a single run does.
-        # 120 min per run is a linear estimate with no ceiling. SRR549749 has
-        # 38 runs, so attempt 3 asked for 13,680 min -- 9.5 days -- and sbatch
-        # rejected it outright ("Requested time limit is invalid"). The sample
-        # then failed for a scheduling reason that looks nothing like its cause.
+        # 120 min per run is a linear estimate, so a many-run sample asks for
+        # more time than any partition allows and sbatch refuses the job
+        # outright: "Requested time limit is invalid". The sample then fails
+        # for a scheduling reason that looks nothing like its cause, and the
+        # log is zero bytes because the shell never ran.
+        #
+        # SRR549749 has 38 runs -> 4,560 min even on attempt 1. Every FASRC
+        # Cannon partition (shared, serial_requeue, sapphire) caps at 3 days =
+        # 4,320 min, so all three attempts were rejected. The default below
+        # sits under that; raise it only after checking `sinfo -o "%.20P %.12l"`
+        # on your own cluster.
         runtime   = lambda wc, attempt: min(
-                        int(config.get("max_runtime_min", 10000)),
+                        int(config.get("max_runtime_min", 4200)),
                         max(300, 120 * len(SAMPLE_RUNS[wc.sample])) * attempt),
         slurm_partition = PART_DOWNLOAD,
     log: "logs/01_download/{sample}.log"
