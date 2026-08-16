@@ -89,6 +89,8 @@ def main() -> int:
     ap.add_argument("--low", type=float, default=50.0,
                     help="alignment %% below which a sample is called low")
     ap.add_argument("--out", default=None, help="write the full table here")
+    ap.add_argument("--exclude-out", default=None,
+                    help="write the low samples as a one-per-line exclusion list")
     args = ap.parse_args()
 
     rows = collect(args.results_dir, args.logs_dir, args.ref)
@@ -157,6 +159,16 @@ def main() -> int:
             w.writeheader()
             w.writerows(rows)
         print(f"\n  wrote {args.out} ({len(rows)} rows)")
+
+    if args.exclude_out:
+        low = [r for r in rows if r["align_pct"] < args.low]
+        with open(args.exclude_out, "w") as fh:
+            fh.write(f"# samples aligning below {args.low:.0f}% against {args.ref}\n")
+            fh.write("# sample\tread_pairs\talign_pct\tsgbs_over_10pct\n")
+            for r in low:
+                fh.write(f"{r['sample']}\t{r['read_pairs']}\t{r['align_pct']}\t"
+                         f"{r['sgbs_over_10pct']}\n")
+        print(f"  wrote {args.exclude_out} ({len(low)} samples below {args.low:.0f}%)")
     return 0
 
 
