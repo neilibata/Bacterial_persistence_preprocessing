@@ -61,6 +61,20 @@ def align_mem(wc, input, attempt):
     return int(config.get("align_mem_mb", 40000)) * attempt
 
 
+def decontam_mem(wc, input, attempt):
+    """Bowtie2 decontamination memory is flat in sample size, like alignment.
+
+    The resident index dominates (~4 GB for hg38) and reads are streamed, so
+    scaling the request with the input was wrong in the same way `align_mem`
+    documents. It only became visible on the largest sample in the cohort:
+    SAMEA4765588 has 1.48 billion reads, whose phiX-removed FASTQs made
+    `input.size_mb * 3` request 180-300 GB. No node in the `shared` partition
+    has that much, so the job could not run and the sample was lost silently
+    under --keep-going.
+    """
+    return int(config.get("decontam_mem_mb", 24000)) * attempt
+
+
 def repair_mem(wc, input, attempt):
     """repair.sh buffers reads to re-pair them, so this one genuinely scales."""
     return int(max(32000, input.size_mb * 4)) * attempt
@@ -454,8 +468,13 @@ rule sra_download:
         mem_mb    = lambda wc, attempt: 10000 * attempt,
         # Download+convert+compress is roughly linear in run count, so a sample
         # with 10 runs needs far more than the 5 h a single run does.
-        runtime   = lambda wc, attempt: max(
-                        300, 120 * len(SAMPLE_RUNS[wc.sample])) * attempt,
+        # 120 min per run is a linear estimate with no ceiling. SRR549749 has
+        # 38 runs, so attempt 3 asked for 13,680 min -- 9.5 days -- and sbatch
+        # rejected it outright ("Requested time limit is invalid"). The sample
+        # then failed for a scheduling reason that looks nothing like its cause.
+        runtime   = lambda wc, attempt: min(
+                        int(config.get("max_runtime_min", 10000)),
+                        max(300, 120 * len(SAMPLE_RUNS[wc.sample])) * attempt),
         slurm_partition = PART_DOWNLOAD,
     log: "logs/01_download/{sample}.log"
     shell:
@@ -528,9 +547,9 @@ rule remove_phix:
     threads: PREPROC_THREADS
     retries: 2
     resources:
-        mem_mb    = lambda wc, input, attempt: max(8000, int(input.size_mb * 2)) * attempt,
+        mem_mb    = decontam_mem,
         runtime   = lambda wc, input, attempt: max(30,   int(input.size_mb / 80)) * attempt,
-        slurm_partition = PART_CPU,
+        slurm_partition = part_by_size,
     log: "logs/02_phix/{sample}.log"
     shell:
         """
@@ -560,9 +579,9 @@ rule remove_human:
     retries: 2
     resources:
         # Human genome alignment needs more memory than PhiX
-        mem_mb    = lambda wc, input, attempt: max(16000, int(input.size_mb * 3)) * attempt,
+        mem_mb    = decontam_mem,
         runtime   = lambda wc, input, attempt: max(120,   int(input.size_mb / 50)) * attempt,
-        slurm_partition = PART_CPU,
+        slurm_partition = part_by_size,
     log: "logs/02_human/{sample}.log"
     shell:
         """
