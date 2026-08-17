@@ -40,6 +40,33 @@ PART_BIGMEM   = config.get("partition_bigmem",  "sapphire")
 BIG_SAMPLE_MB = int(config.get("big_sample_mb", 15000))
 
 
+def capped_runtime(minutes):
+    """Clamp a runtime estimate to something sbatch will accept.
+
+    Every runtime here is a linear extrapolation from input size or run count,
+    and every one of them is generous: SRR549749's align was estimated at 1,447
+    minutes and finished in 118. That over-estimate is harmless until it crosses
+    the partition's own limit, at which point sbatch rejects the job outright
+    with "Requested time limit is invalid" -- and because the shell never runs,
+    the rule's log is zero bytes and the failure looks nothing like its cause.
+
+    Worse, Snakemake's retry multiplies the estimate by the attempt number, so a
+    request that was rejected for being too long is resubmitted at 2x and 3x. It
+    can never recover; it just fails three times and takes the workflow down.
+
+    This bit sra_download once (SRR549749, 38 runs -> 4,560 min) and the cap was
+    added there only. It then bit align on SAMEA4765588, the deepest sample in
+    Carter 2023 at 209 Gbp -- 66 GB of repaired FASTQ / 12 = 5,679 min, against
+    the 3-day (4,320 min) ceiling every FASRC Cannon partition enforces. One
+    sample in 468. Hence a single shared helper rather than a per-rule fix, and
+    hence the clamp AFTER the attempt multiplier rather than before it.
+
+    Check your own cluster with `sinfo -o "%.20P %.12l"` before raising it.
+    """
+    ceiling = int(config.get("max_runtime_min", 4200))
+    return max(10, min(ceiling, int(minutes)))
+
+
 def part_by_size(wc, input):
     """Send large inputs to the high-memory-per-core partition."""
     try:
@@ -479,8 +506,7 @@ rule sra_download:
         # 4,320 min, so all three attempts were rejected. The default below
         # sits under that; raise it only after checking `sinfo -o "%.20P %.12l"`
         # on your own cluster.
-        runtime   = lambda wc, attempt: min(
-                        int(config.get("max_runtime_min", 4200)),
+        runtime   = lambda wc, attempt: capped_runtime(
                         max(300, 120 * len(SAMPLE_RUNS[wc.sample])) * attempt),
         slurm_partition = PART_DOWNLOAD,
     log: "logs/01_download/{sample}.log"
@@ -526,7 +552,7 @@ rule trim_galore:
     retries: 2
     resources:
         mem_mb    = lambda wc, input, attempt: max(8000, int(input.size_mb * 2)) * attempt,
-        runtime   = lambda wc, input, attempt: max(60,   int(input.size_mb / 80)) * attempt,
+        runtime   = lambda wc, input, attempt: capped_runtime(max(60,   int(input.size_mb / 80)) * attempt),
         slurm_partition = PART_CPU,
     log: "logs/02_trim/{sample}.log"
     shell:
@@ -555,7 +581,7 @@ rule remove_phix:
     retries: 2
     resources:
         mem_mb    = decontam_mem,
-        runtime   = lambda wc, input, attempt: max(30,   int(input.size_mb / 80)) * attempt,
+        runtime   = lambda wc, input, attempt: capped_runtime(max(30,   int(input.size_mb / 80)) * attempt),
         slurm_partition = part_by_size,
     log: "logs/02_phix/{sample}.log"
     shell:
@@ -587,7 +613,7 @@ rule remove_human:
     resources:
         # Human genome alignment needs more memory than PhiX
         mem_mb    = decontam_mem,
-        runtime   = lambda wc, input, attempt: max(120,   int(input.size_mb / 50)) * attempt,
+        runtime   = lambda wc, input, attempt: capped_runtime(max(120,   int(input.size_mb / 50)) * attempt),
         slurm_partition = part_by_size,
     log: "logs/02_human/{sample}.log"
     shell:
@@ -616,7 +642,7 @@ rule repair_mates:
     retries: 2
     resources:
         mem_mb    = repair_mem,
-        runtime   = lambda wc, input, attempt: max(60,   int(input.size_mb / 60)) * attempt,
+        runtime   = lambda wc, input, attempt: capped_runtime(max(60,   int(input.size_mb / 60)) * attempt),
         slurm_partition = part_by_size,
     log: "logs/02_repair/{sample}.log"
     shell:
@@ -674,7 +700,7 @@ rule align:
     retries: 2
     resources:
         mem_mb    = align_mem,
-        runtime   = lambda wc, input, attempt: max(180,   int(input.size_mb / 12)) * attempt,
+        runtime   = lambda wc, input, attempt: capped_runtime(max(180,   int(input.size_mb / 12)) * attempt),
         slurm_partition = part_by_size,
     log: ref_log("03_align/{sample}.log")
     shell:
@@ -723,7 +749,7 @@ rule filter_mapq:
     retries: 2
     resources:
         mem_mb    = lambda wc, input, attempt: max(8000, int(input.size_mb * 1.5)) * attempt,
-        runtime   = lambda wc, input, attempt: max(30,   int(input.size_mb / 200)) * attempt,
+        runtime   = lambda wc, input, attempt: capped_runtime(max(30,   int(input.size_mb / 200)) * attempt),
         slurm_partition = PART_SHARED,
     log: ref_log("04_filter/{sample}.log")
     shell:
@@ -756,7 +782,7 @@ rule extract_coverage:
     retries: 2
     resources:
         mem_mb    = lambda wc, input, attempt: max(4000, int(input.size_mb * 1.5)) * attempt,
-        runtime   = lambda wc, input, attempt: max(30,   int(input.size_mb / 100)) * attempt,
+        runtime   = lambda wc, input, attempt: capped_runtime(max(30,   int(input.size_mb / 100)) * attempt),
         slurm_partition = PART_SHARED,
     log: ref_log("05_coverage/{tier}/{sample}.log")
     shell:
