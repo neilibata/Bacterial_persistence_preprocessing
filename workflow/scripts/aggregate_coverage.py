@@ -29,6 +29,65 @@ import pandas as pd
 from collections import defaultdict
 
 
+
+# ══════════════════════════════════════════════════════════════════════
+#  Amplicon gate
+# ══════════════════════════════════════════════════════════════════════
+# Random shotgun ties breadth to depth: at genome-wide depth d the expected
+# breadth is 1 - e^-d, so at the depths seen here breadth ~= depth and the depth
+# over the COVERED bases sits near 1x. Amplicon reads break that. They pile onto
+# one conserved window of every reference they match, so the covered fraction
+# stays tiny while the depth on it climbs without limit.
+#
+# This was not hypothetical. 16S libraries registered as WGS in MehtaRS 2018
+# reached the analysis undetected: 379 bp covered per reference at up to 45,262x
+# on that window, against 1-2x for genuine shotgun. They passed the >= 30 Mb
+# mapped-bases filter because their mapped bases are real -- they are simply all
+# in one place -- so no depth-based check could have caught them.
+#
+# Thresholds are empirical, from 24,173 samples in the 2026-08-20 cohort:
+#
+#   depth per covered base   cohort median 1.77, p99 4.29, and FLAT across every
+#                            breadth band (1.68-1.99), exactly as the physics
+#                            predicts. Confirmed amplicon samples sat at 4.9.
+#   median breadth           the elevated-dpcb subpopulation exists ONLY below
+#                            0.02%. Above it the p90 pins at ~2.25 in every band;
+#                            below it the p90 is 6.6-10.7.
+#
+# Both conditions are required. Low breadth alone is just a shallow sample, and
+# a high ratio alone occurs in deep well-structured samples.
+AMPLICON_MAX_BREADTH_PCT = 0.02   # median breadth across covered species
+AMPLICON_MIN_DPCB        = 2.5    # depth per covered base; cohort median is 1.77
+QC_FLAG_SUFFIX           = "_AMPLICON_SUSPECT.tsv"
+
+
+def amplicon_signature(results):
+    """Breadth/depth consistency for one sample. None if nothing is covered."""
+    import statistics as _st
+
+    breadths, dpcb = [], []
+    for r in results:
+        cov = r["Weighted_Mean_Coverage"]
+        if cov <= 0:
+            continue
+        breadths.append(cov)
+        # depth per covered base = genome-wide depth / covered fraction
+        dpcb.append(r["Weighted_Mean_Depth"] / (cov / 100.0))
+    if not breadths:
+        return None
+
+    mb = _st.median(breadths)
+    md = _st.median(dpcb)
+    suspect = (mb < AMPLICON_MAX_BREADTH_PCT) and (md > AMPLICON_MIN_DPCB)
+    return {
+        "median_breadth_pct": mb,
+        "dpcb_median": md,
+        "n_species": len(breadths),
+        "suspect": suspect,
+        "verdict": "amplicon-like" if suspect else "shotgun-like",
+    }
+
+
 def main():
     if len(sys.argv) != 5:
         print("Usage: python aggregate_coverage.py <sample_id> <input_dir> <output_dir> <contig_lengths_file>")
@@ -138,7 +197,25 @@ def main():
         })
 
     # ------------------------------------------------------------------
-    # 7. Save
+    # 7. Amplicon gate
+    # ------------------------------------------------------------------
+    flags = amplicon_signature(results)
+    if flags:
+        print(f"  [QC] {sample_id}: {flags['verdict']} — "
+              f"median breadth {flags['median_breadth_pct']:.4f}%, "
+              f"depth/covered-base {flags['dpcb_median']:.2f}x "
+              f"over {flags['n_species']} species")
+        if flags["suspect"]:
+            print(f"  [QC] {sample_id}: SUSPECTED AMPLICON — excluded from the "
+                  f"analysis-ready set. See {QC_FLAG_SUFFIX}.")
+            with open(os.path.join(output_dir, f"{sample_id}{QC_FLAG_SUFFIX}"), "w") as fh:
+                fh.write("# sample\tmedian_breadth_pct\tdpcb_median\tn_species\tverdict\n")
+                fh.write(f"{sample_id}\t{flags['median_breadth_pct']:.6f}\t"
+                         f"{flags['dpcb_median']:.4f}\t{flags['n_species']}\t"
+                         f"{flags['verdict']}\n")
+
+    # ------------------------------------------------------------------
+    # 8. Save
     # ------------------------------------------------------------------
     outfile = os.path.join(output_dir, f"{sample_id}_depth_and_coverage_stats.csv")
     pd.DataFrame(results).to_csv(outfile, index=False)
