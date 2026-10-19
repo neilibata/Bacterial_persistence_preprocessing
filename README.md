@@ -259,7 +259,7 @@ Each box above runs as independent SLURM jobs. With `max_jobs=200`, the pipeline
  ┌───────────────────────────────────────────────────────┐
  │  sbatch run_pipeline.sh                               │
  │  ┌─────────────────────────────────────────────────┐  │
- │  │  Snakemake orchestrator (1 CPU, 4 GB, 7 days)   │  │
+ │  │  Snakemake orchestrator (1 CPU, 4 GB, long)     │  │
  │  │                                                   │  │
  │  │  Submits + monitors child SLURM jobs:            │  │
  │  │    → sbatch trim_galore  (8 CPU, ~16 GB)         │  │
@@ -271,7 +271,29 @@ Each box above runs as independent SLURM jobs. With `max_jobs=200`, the pipeline
  └───────────────────────────────────────────────────────┘
 ```
 
-The orchestrator itself is a tiny job (1 CPU, 4 GB) that runs for up to 7 days. It uses `sbatch` to submit compute-heavy work as separate SLURM jobs, then polls their status via `sacct`. This means the orchestrator can run on any low-priority partition.
+The orchestrator itself is a tiny job (1 CPU, 4 GB) that submits compute-heavy
+work as separate SLURM jobs via `sbatch` and polls them with `sacct`. Because
+it only sleeps and polls, it can sit on any low-priority partition — but it
+has to **stay alive for the whole run**, and that is where walltime limits
+bite.
+
+Most partitions cap well below a long run. On Cannon every general partition
+stops at 3 days:
+
+| partition | max walltime |
+|---|---|
+| `shared`, `serial_requeue`, `sapphire`, `bigmem` | 3 days |
+| `intermediate`, `bigmem_intermediate` | 14 days |
+| `unrestricted` | 365 days |
+
+`sbatch` **rejects** an over-limit request rather than trimming it, so asking
+7 days on `shared` means the run never starts. `setup.sh` therefore asks which
+partition to put the orchestrator on, defaults to the longest-walltime
+partition it can find in `sinfo`, and clamps `--time` to what that partition
+actually allows. The committed default is a safe 3 days on `shared`.
+
+If the orchestrator does run out of time, re-submit: Snakemake skips completed
+samples and continues.
 
 ## How Failures Are Handled
 

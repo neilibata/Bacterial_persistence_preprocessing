@@ -2,7 +2,13 @@
 #SBATCH --job-name=smk_orchestrator
 #SBATCH --output=logs/orchestrator_%j.out
 #SBATCH --error=logs/orchestrator_%j.err
-#SBATCH --time=7-00:00:00
+# 3 days, not the 7 the orchestrator would like: every general partition on
+# the cluster this was built for caps there, and sbatch rejects an over-limit
+# request outright rather than trimming it, so the run would never start.
+# setup.sh raises this if it finds a partition that allows more (and picks
+# that partition). Snakemake resumes where it stopped, so re-submitting an
+# orchestrator that ran out of time costs nothing but the queue wait.
+#SBATCH --time=3-00:00:00
 #SBATCH --mem=4G
 #SBATCH --cpus-per-task=1
 #SBATCH --partition=shared

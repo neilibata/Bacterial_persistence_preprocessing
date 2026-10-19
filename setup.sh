@@ -81,6 +81,41 @@ PART_SHARED=${PART_SHARED:-shared}
 read -rp "Download partition (needs internet) [$PART_CPU]: " PART_DL
 PART_DL=${PART_DL:-$PART_CPU}
 
+# --- Orchestrator partition and walltime ---------------------------------
+# The orchestrator is 1 CPU and 4 GB that mostly sleeps, but it has to stay
+# alive for the whole run, and most partitions cap walltime well below that:
+# on the cluster this was built for, every general partition stops at 3 days
+# while the orchestrator asked for 7. sbatch rejects that outright -- the run
+# never starts -- so pick the partition and then clamp the request to whatever
+# that partition actually permits.
+part_maxtime () {  # minutes, or empty if sinfo cannot say
+    command -v sinfo &>/dev/null || return 0
+    sinfo -h -p "$1" -o '%l' 2>/dev/null | head -1 | awk '
+        /infinite|UNLIMITED/ { print 525600; exit }
+        /-/  { split($0,a,"-"); split(a[2],b,":"); print a[1]*1440 + b[1]*60 + b[2]; exit }
+        /:/  { n=split($0,b,":"); if (n==3) print b[1]*60+b[2]; else print b[1]; exit }'
+}
+LONGEST=""
+if command -v sinfo &>/dev/null; then
+    LONGEST=$(for p in $(sinfo -h -o '%P' 2>/dev/null | tr -d '*' | sort -u); do
+                  m=$(part_maxtime "$p"); [[ -n "$m" ]] && echo "$m $p"
+              done | sort -rn | head -1 | awk '{print $2}')
+fi
+read -rp "Orchestrator partition (long walltime, 1 CPU) [${LONGEST:-$PART_SHARED}]: " PART_ORCH
+PART_ORCH=${PART_ORCH:-${LONGEST:-$PART_SHARED}}
+
+ORCH_WANT_MIN=10080                        # 7 days, what the pipeline prefers
+ORCH_MAX=$(part_maxtime "$PART_ORCH")
+if [[ -n "$ORCH_MAX" && "$ORCH_MAX" -gt 0 && "$ORCH_MAX" -lt "$ORCH_WANT_MIN" ]]; then
+    ORCH_MIN=$ORCH_MAX
+    echo "  note: $PART_ORCH allows at most $((ORCH_MAX/1440))d $(((ORCH_MAX%1440)/60))h;"
+    echo "        the orchestrator will request that instead of 7 days."
+    echo "        Snakemake resumes where it stopped, so re-submit if it runs out."
+else
+    ORCH_MIN=$ORCH_WANT_MIN
+fi
+ORCH_TIME=$(printf '%d-%02d:%02d:00' $((ORCH_MIN/1440)) $(((ORCH_MIN%1440)/60)) $((ORCH_MIN%60)))
+
 DEFAULT_ACCT="${DETECTED_ACCOUNT:-}"
 if [[ -n "$DEFAULT_ACCT" ]]; then
     read -rp "SLURM account (detected: $DEFAULT_ACCT) [$DEFAULT_ACCT]: " SLURM_ACCT
@@ -240,7 +275,9 @@ echo "Profile written to $PROFILE"
 if [[ -n "$SLURM_ACCT" ]]; then
     sed -i "s/^#SBATCH --account=.*/#SBATCH --account=$SLURM_ACCT/" run_pipeline.sh
 fi
-sed -i "s/^#SBATCH --partition=.*/#SBATCH --partition=$PART_SHARED/" run_pipeline.sh
+sed -i "s/^#SBATCH --partition=.*/#SBATCH --partition=$PART_ORCH/" run_pipeline.sh
+sed -i "s/^#SBATCH --time=.*/#SBATCH --time=$ORCH_TIME/" run_pipeline.sh
+echo "Orchestrator: $PART_ORCH, --time=$ORCH_TIME"
 
 # --- Create log dirs ---
 mkdir -p logs/slurm

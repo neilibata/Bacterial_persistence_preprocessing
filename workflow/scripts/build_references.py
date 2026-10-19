@@ -344,10 +344,37 @@ def build(ref: str, out_dir: Path, cache: Path, subset: int | None,
     if subset:
         genomes = genomes[:subset]
         keep = {g["genome"] for g in genomes}
-        contigs = [(n, L) for n, L in contigs
-                   if _genome_of(n) in keep]
+        contigs = [(n, L) for n, L in contigs if _genome_of(n) in keep]
         print(f"  subset: first {len(genomes)} genome(s), "
               f"{len(contigs)} contig(s)")
+
+    # Every genome the manifest lists must actually have its contigs found by
+    # _genome_of, and as many as the manifest counted. Without this the two
+    # notions of "which genome is this" can disagree -- the staging step reads
+    # the genome column while the contig selection reads the contig names --
+    # and a build then verifies against its own reduced expectation and
+    # reports success having silently dropped whole genomes.
+    found = {}
+    for n, _L in contigs:
+        found[_genome_of(n)] = found.get(_genome_of(n), 0) + 1
+    unresolved = [g["genome"] for g in genomes if g["genome"] not in found]
+    miscounted = [(g["genome"], g["n_contigs"], found[g["genome"]])
+                  for g in genomes
+                  if g["genome"] in found
+                  and found[g["genome"]] != g["n_contigs"]]
+    if unresolved or miscounted:
+        print(f"\n  manifest inconsistency -- refusing to build:",
+              file=sys.stderr)
+        for g in unresolved[:5]:
+            print(f"      {g}: no contig in the manifest resolves to it",
+                  file=sys.stderr)
+        for g, want_n, got_n in miscounted[:5]:
+            print(f"      {g}: manifest says {want_n} contigs, "
+                  f"{got_n} resolve to it", file=sys.stderr)
+        extra = len(unresolved) + len(miscounted) - 5
+        if extra > 0:
+            print(f"      ... and {extra} more", file=sys.stderr)
+        return 1
 
     want = dict(contigs)
     order = [n for n, _ in contigs]
@@ -467,8 +494,18 @@ def build(ref: str, out_dir: Path, cache: Path, subset: int | None,
 
 
 def _genome_of(contig: str) -> str:
+    """The genome a contig belongs to, from its name alone.
+
+    The chimp catalogue is split on the pipe rather than pattern-matched: its
+    MAG names contain dots (WC16_bin.25, WC16_WC16.038) and a \\w-based
+    pattern cannot span one, so a regex here resolved 35 of 40 genomes and
+    silently attributed the rest to nothing. Everything before the first pipe
+    is the MAG, under both of the archive's naming conventions.
+    """
+    if "|" in contig:
+        return contig.split("|", 1)[0]
     for rx in (r"^(GCA_\d+\.\d+)_c_\d+$", r"^(MGYG\d+(?:\.\d+)?)_\d+$",
-               r"^(Rep_\d+)_c_\d+$", r"^(WC\w+?)\|c_\d+$"):
+               r"^(Rep_\d+)_c_\d+$"):
         m = re.match(rx, contig)
         if m:
             return m.group(1)
