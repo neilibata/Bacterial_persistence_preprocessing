@@ -35,3 +35,12 @@ Thumbs.db
 
 # Config backups from setup.sh re-runs
 config/config.yaml.bak.*
+
+# Reference catalogues are rebuilt by workflow/scripts/build_references.py,
+# never committed: they are 3.6-11.8 GB each and three of the four are other
+# groups' published data.
+resources/reference_metagenome.fna
+resources/*.fna
+resources/*.fa
+references/
+reference_sources/

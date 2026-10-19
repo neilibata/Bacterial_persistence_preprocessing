@@ -44,8 +44,13 @@ A Snakemake pipeline that processes shotgun metagenomic data from raw SRA access
 | File | Description |
 |---|---|
 | `resources/samples.tsv` | Sample list — see **Sample list formats** below |
-| `resources/reference_metagenome.fna` | Your metagenome reference FASTA (e.g. UHGG subset) |
-| `resources/contig_to_species.tsv` | Mapping: `species_id <TAB> contig_name <TAB> length` |
+
+That is the only file you supply. The reference catalogue and its contig map
+are **rebuilt from their public sources** by
+`workflow/scripts/build_references.py` — see
+**[Reference catalogues](#reference-catalogues)** — and are deliberately not
+committed: each is 3.6–11.8 GB, and three of the four are other groups'
+published data.
 
 Everything else — downloading PhiX/hg38 genomes, building all Bowtie2 indices, QC, alignment, filtering, coverage extraction, aggregation, and matrix combination — runs automatically.
 
@@ -95,20 +100,116 @@ cd Bacterial_evolution_health
 conda env create -f environment.yaml
 conda activate bact_evo_pipeline
 
-# 3. Place your three input files in resources/
+# 3. Put your sample list at resources/samples.tsv
 
-# 4. Run interactive setup (detects partitions, conda path, writes config)
+# 4. Rebuild the reference catalogue you want (see Reference catalogues).
+#    --subset 12 first if you want to watch the whole path work cheaply.
+python workflow/scripts/build_references.py --ref combined --out references/
+
+# 5. Run interactive setup (detects partitions, conda path, writes config)
 bash setup.sh
 
-# 5. Preview what would run
+# 6. Preview what would run
 bash run_pipeline.sh --dry-run
 
-# 6. Launch on SLURM
+# 7. Launch on SLURM
 sbatch run_pipeline.sh
 
-# 7. Check progress any time
+# 8. Check progress any time
 bash run_pipeline.sh --status
 ```
+
+## Reference catalogues
+
+The pipeline aligns against one of four catalogues. None is committed here:
+each is 3.6–11.8 GB, and three of the four are other groups' published data,
+so this repository ships the **recipe** rather than copies. Rebuilding gives a
+file that is byte-identical to the one the reported analysis used, and the
+build proves that rather than assuming it.
+
+```bash
+python workflow/scripts/build_references.py --ref combined --out references/
+```
+
+| `--ref` | Genomes | Size | Source | Licence |
+|---|---|---|---|---|
+| `carter` | 3,971 | 9.1 GB | NCBI GenBank (1,816 `GCA_*`) + MGnify `human-gut-v2-0-2` (2,155 `MGYG*`) | open |
+| `leviatan` | 3,594 | 8.9 GB | figshare [`10.6084/m9.figshare.16885261`](https://doi.org/10.6084/m9.figshare.16885261) → `Rep_all.fa.gz` | CC BY 4.0 |
+| `combined` | 5,081 | 11.8 GB | all of `leviatan`, plus the 1,487 `carter` genomes dereplication kept | — |
+| `chimp` | 1,682 | 3.7 GB | Dryad [`10.5061/dryad.00000006x`](https://doi.org/10.5061/dryad.00000006x) → `ChimpMAGs.tar` | CC0 1.0 |
+
+`combined` is the reference the manuscript reports; `chimp` is the negative
+control. `--cite` prints every source and licence without downloading
+anything.
+
+**Cite the catalogues, not just this repository:** Carter et al. (*Cell* 2023;
+*Nature* 2026), Leviatan et al. (*Nat Commun* 13, 3863, 2022 — whose own
+construction code is at [erans99/GutReferenceSet](https://github.com/erans99/GutReferenceSet)),
+and Sanders et al. (*Nat Microbiol* 8, 1039–1050, 2023).
+
+### What the build produces
+
+Two files, which are the two the pipeline needs:
+
+- `<ref>.fna` — the catalogue, plus a `.sha256` beside it
+- `<ref>.contig_to_species.tsv` — `species <TAB> contig <TAB> length`, derived
+  from the reference rather than shipped, so the two cannot drift apart
+
+The Bowtie2 index is **not** built here: `rule build_metagenome_index` does it
+inside the workflow, with `--large-index`, which every one of these catalogues
+needs. Run `build_references.py --index` only if you want the index outside a
+workflow run.
+
+Put the two paths into `config.yaml` — the build prints them:
+
+```yaml
+reference_fasta:   references/combined.fna
+contig_to_species: references/combined.contig_to_species.tsv
+```
+
+### Proving it works before committing to the download
+
+```bash
+python workflow/scripts/build_references.py --ref carter --subset 12 --out proof/
+```
+
+That fetches 12 genomes (~16 MB), renames and concatenates them, and checks
+every contig name and length against the manifest. It exercises both of
+`carter`'s fetch routes and the full rename-and-verify path in under a minute.
+`--verify-only <fasta>` checks a catalogue you already have.
+
+### Cost of a full rebuild
+
+| `--ref` | Downloads | Notes |
+|---|---|---|
+| `carter` | 3,971 requests | the slow one: one listing plus one fetch per GenBank accession. Hours, and resumable — the source cache is re-used. |
+| `leviatan` | 1 file, 2.7 GB | fast |
+| `chimp` | 1 file, 8.7 GB | fast |
+| `combined` | re-uses `carter` + `leviatan` sources | build `carter` first and the fetches are already cached |
+
+Budget roughly 15 GB for the source cache on top of the catalogue itself, and
+a further ~22 GB if you let the workflow build the `combined` index.
+
+### Why the manifests exist
+
+`resources/reference_manifests/` holds, per catalogue, the genome order and
+every contig's name and length (12 MB in total). The build follows them rather
+than re-deriving a naming rule, because the rules are not uniform and the
+differences are not guessable:
+
+- `MGYG*` contigs are used **verbatim** — MGnify already names them
+  `MGYG000004406_1`, which is why these indices start at 1 and the others at 0
+- `GCA_*` and `Rep_*` are renamed `<genome>_c_<i>`, `i` from 0, in source order
+- chimp contigs are prefixed, not renumbered: `<MAG>|<original contig>`, which
+  is why `c_000000000001` and `k141_<n>` names sit side by side
+- three MGYG genomes are short a few contigs against their source
+  (`MGYG000001406.1`, `MGYG000001455.1`, `MGYG000001456.1`), and a fourth
+  carries a `.1` suffix the rest do not
+
+Those are properties of the catalogue the analysis actually read, not defects
+to correct, so the manifest records them and the build reproduces them. A
+mismatch in any contig name or length stops the build rather than producing a
+reference that is subtly not the reported one.
 
 ## Pipeline Overview
 
