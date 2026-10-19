@@ -167,10 +167,12 @@ def fetch_mgyg(acc: str, cache: Path) -> Path:
     if out.exists() and out.stat().st_size:
         return out
     out.parent.mkdir(parents=True, exist_ok=True)
-    # The accession in the catalogue may carry a version suffix that MGnify's
-    # own API does not use; strip it for the request, keep it for the name.
-    api_acc = acc.split(".")[0]
-    out.write_bytes(_get(f"{MGNIFY}/{api_acc}/downloads/{api_acc}.fna"))
+    # Use the accession exactly as the catalogue spells it, suffix included.
+    # Four UHGG genomes carry a `.1` that is part of the accession itself
+    # (MGYG000001302.1 = GUT_GENOME095971, and three others), and stripping it
+    # turned a valid accession into a 404 -- which looked like an upstream
+    # retirement and was not.
+    out.write_bytes(_get(f"{MGNIFY}/{acc}/downloads/{acc}.fna"))
     return out
 
 
@@ -191,39 +193,96 @@ def fetch_bulk(ref: str, cache: Path) -> Path:
         meta = json.loads(_get(DRYAD_VERSION + "?per_page=100", timeout=120))
         f = next(x for x in meta["_embedded"]["stash:files"]
                  if x["path"] == "ChimpMAGs.tar")
-        url = "https://datadryad.org" + \
-            f["_links"]["stash:file-download"]["href"]
-    print(f"    fetching {out.name} ({url[:70]}...)")
-    with urllib.request.urlopen(url, timeout=1800) as r, open(out, "wb") as w:
-        while True:
-            b = r.read(1 << 22)
-            if not b:
-                break
-            w.write(b)
-    return out
+        # Dryad's link relation is `stash:download`, not `stash:file-download`.
+        links = f.get("_links") or {}
+        rel = links.get("stash:download") or links.get("stash:file-download")
+        if not rel or not rel.get("href"):
+            raise KeyError(
+                "no download link on the Dryad file record; relations present: "
+                + ", ".join(sorted(links)))
+        url = "https://datadryad.org" + rel["href"]
+    # Dryad does not serve this file to scripts. The v2 API download endpoint
+    # answers 401 ("must have current bearer token") and the file_stream route
+    # the landing page itself uses answers 403 even to a GET with a browser
+    # user-agent, so there is no unauthenticated route to automate. The file is
+    # openly downloadable by a person from the dataset page, so say that
+    # plainly and pick it up from the cache on the next run rather than failing
+    # with a stack trace.
+    candidates = [url]
+    if ref == "chimp":
+        fid = url.rstrip("/").split("/")[-2] if url.endswith("/download") else None
+        if fid:
+            candidates.append(f"https://datadryad.org/downloads/file_stream/{fid}")
+    last = None
+    for u in candidates:
+        print(f"    fetching {out.name} ({u[:72]}...)")
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=1800) as r, \
+                    open(out, "wb") as w:
+                while True:
+                    b = r.read(1 << 22)
+                    if not b:
+                        break
+                    w.write(b)
+            return out
+        except Exception as exc:                        # noqa: BLE001
+            last = exc
+            out.unlink(missing_ok=True)
+            print(f"      {type(exc).__name__}: {exc}")
+    raise SystemExit(
+        f"\n  Could not fetch {out.name} automatically ({last}).\n"
+        f"\n  Dryad serves this file to browsers but not to scripts. Download it\n"
+        f"  by hand, then re-run this command -- the cache is reused and the\n"
+        f"  build continues from there:\n"
+        f"\n      open https://datadryad.org/dataset/doi:10.5061/dryad.00000006x\n"
+        f"      # save ChimpMAGs.tar (8.7 GB, CC0) to:\n"
+        f"      {out}\n"
+        f"\n  Expected size 8,733,429,248 bytes.\n")
 
 
 # ───────────────────────────── reading sources ────────────────────────────
-def read_fasta(path_or_bytes) -> list[tuple[str, str]]:
-    """[(name, sequence)] in file order, sequence uppercased and unwrapped."""
+def read_fasta(path_or_bytes) -> list[tuple[str, list[str], str]]:
+    """[(name, [sequence lines verbatim], text that followed the name)].
+
+    The third element matters for the chimp catalogue, which *prefixes* its
+    headers rather than renaming them, so megahit's `flag=.. multi=.. len=..`
+    description survives into the catalogue. Dropping it cost about 30 bytes
+    per contig across ~398,000 contigs -- 11.9 MB, and the only reason the
+    chimp rebuild did not match. carter and leviatan rename their headers
+    outright, so there the description is correctly discarded.
+
+    The lines are kept verbatim -- not re-wrapped, not case-folded -- because
+    the catalogues preserve each source's own formatting and a rebuild has to
+    match it to be byte-identical. carter wraps its GCA-derived contigs at 80
+    and its MGnify-derived contigs at 60, and carries soft-masked lowercase in
+    places; re-wrapping everything to one width and upper-casing produced a
+    file 21.5 MB larger whose sequence was right and whose bytes were not.
+    """
     if isinstance(path_or_bytes, (bytes, bytearray)):
         fh = io.StringIO(path_or_bytes.decode("utf8", "replace"))
     elif str(path_or_bytes).endswith(".gz"):
         fh = gzip.open(path_or_bytes, "rt")
     else:
         fh = open(path_or_bytes)
-    recs, name, buf = [], None, []
+    recs, name, buf, desc = [], None, [], ""
     with fh:
         for line in fh:
             if line.startswith(">"):
                 if name is not None:
-                    recs.append((name, "".join(buf)))
-                name = line[1:].split()[0]
+                    recs.append((name, buf, desc))
+                head = line[1:].rstrip("\n\r")
+                name = head.split()[0] if head.split() else head
+                desc = head[len(name):]
                 buf = []
             else:
-                buf.append(line.strip().upper())
+                # Blank lines are kept. MGnify writes one after every contig,
+                # 526 of them in MGYG000002312 for its 526 contigs, and the
+                # catalogue preserved them -- dropping them cost exactly one
+                # byte per contig across 134 genomes, 7,509 bytes in all.
+                buf.append(line.rstrip("\n\r"))
     if name is not None:
-        recs.append((name, "".join(buf)))
+        recs.append((name, buf, desc))
     return recs
 
 
@@ -239,16 +298,19 @@ def source_records(ref: str, g: dict, cache: Path, bulk=None):
         return read_fasta(fetch_mgyg(acc, cache / "mgyg"))
     if scheme == "gca":
         recs = read_fasta(fetch_gca(acc, cache / "gca"))
-        return [(f"{acc}_c_{i}", s) for i, (_, s) in enumerate(recs)]
+        return [(f"{acc}_c_{i}", ls, "") for i, (_, ls, _d) in enumerate(recs)]
     raise ValueError(f"{scheme!r} is streamed, not fetched per genome")
 
 
 def _write_records(path: Path, recs) -> None:
+    """Append records, preserving each one's own line breaks."""
     with open(path, "a") as w:
-        for name, seq in recs:
-            w.write(f">{name}\n")
-            for i in range(0, len(seq), 60):
-                w.write(seq[i:i + 60] + "\n")
+        for rec in recs:
+            name, lines = rec[0], rec[1]
+            desc = rec[2] if len(rec) > 2 else ""
+            w.write(f">{name}{desc}\n")
+            for ln in lines:
+                w.write(ln + "\n")
 
 
 def stage_bulk(ref: str, cache: Path, stage: Path, need: set) -> None:
@@ -280,7 +342,7 @@ def stage_bulk(ref: str, cache: Path, stage: Path, need: set) -> None:
             i = seen[g]
             seen[g] = i + 1
             kept.add(g)
-            _write_records(stage / f"{g}.fa", [(f"{g}_c_{i}", "".join(buf))])
+            _write_records(stage / f"{g}.fa", [(f"{g}_c_{i}", list(buf), "")])
 
         with gzip.open(p, "rt") as fh:
             for line in fh:
@@ -289,7 +351,7 @@ def stage_bulk(ref: str, cache: Path, stage: Path, need: set) -> None:
                     name = line[1:].split()[0]
                     buf = []
                 else:
-                    buf.append(line.strip().upper())
+                    buf.append(line.rstrip("\n\r"))
             flush()
         print(f"    staged {len(kept):,} of {len(need):,} needed genome(s)")
         return
@@ -321,9 +383,12 @@ def stage_bulk(ref: str, cache: Path, stage: Path, need: set) -> None:
                 fo = tf.extractfile(m)
                 if fo is None:
                     continue
+                # Prefix, do not rename: the text after the contig name is
+                # megahit's `flag=.. multi=.. len=..`, which the catalogue
+                # keeps, so it is carried through rather than discarded.
                 _write_records(stage / f"{mag}.fa",
-                               [(f"{mag}|{n}", s)
-                                for n, s in read_fasta(fo.read())])
+                               [(f"{mag}|{nm}", lines, dsc)
+                                for nm, lines, dsc in read_fasta(fo.read())])
                 kept += 1
                 if kept % 400 == 0:
                     print(f"      {kept:,}/{len(need):,}")
@@ -339,7 +404,7 @@ def collections_counter():
 
 # ──────────────────────────────── building ────────────────────────────────
 def build(ref: str, out_dir: Path, cache: Path, subset: int | None,
-          do_index: bool) -> int:
+          do_index: bool, allow_incomplete: bool = False) -> int:
     genomes, contigs = load_manifest(ref)
     if subset:
         genomes = genomes[:subset]
@@ -394,18 +459,49 @@ def build(ref: str, out_dir: Path, cache: Path, subset: int | None,
     per_acc = [g for g in genomes if g["scheme"] in ("gca", "mgyg")]
     if per_acc:
         print(f"\n  fetching {len(per_acc):,} per-accession genome(s)")
+    # Collect every failure rather than stopping at the first. A carter build
+    # is ~3,900 fetches and takes half an hour; aborting on genome one turns a
+    # single diagnosis into as many runs as there are problems.
+    failed: list[tuple[str, str]] = []
     for n, g in enumerate(per_acc, 1):
         dst = stage / f"{g['genome']}.fa"
         if dst.exists() and dst.stat().st_size:
             continue
         if n % 250 == 0 or n == len(per_acc):
-            print(f"    {n:,}/{len(per_acc):,}")
+            print(f"    {n:,}/{len(per_acc):,}"
+                  + (f"   ({len(failed)} failed so far)" if failed else ""))
         try:
             _write_records(dst, source_records(ref, g, cache))
         except Exception as exc:                       # noqa: BLE001
-            print(f"    FAILED {g['genome']}: {type(exc).__name__}: {exc}",
-                  file=sys.stderr)
+            dst.unlink(missing_ok=True)
+            failed.append((g["genome"], f"{type(exc).__name__}: {exc}"))
+
+    omitted: set[str] = set()
+    if failed:
+        print(f"\n  {len(failed)} genome(s) could not be fetched:",
+              file=sys.stderr)
+        for gname, err in failed[:12]:
+            print(f"      {gname}: {err}", file=sys.stderr)
+        if len(failed) > 12:
+            print(f"      ... and {len(failed) - 12} more", file=sys.stderr)
+        n_c = sum(g["n_contigs"] for g in genomes
+                  if g["genome"] in {f[0] for f in failed})
+        print(f"\n  that is {len(failed)} of {len(genomes):,} genome(s) and "
+              f"{n_c:,} of {len(contigs):,} contig(s)", file=sys.stderr)
+        if not allow_incomplete:
+            print("\n  refusing to write a reference that is missing contigs the\n"
+                  "  manifest names: an incomplete catalogue changes which taxa\n"
+                  "  can be detected at all, and nothing downstream would notice.\n"
+                  "  Pass --allow-incomplete to build anyway; the omission is then\n"
+                  "  recorded beside the FASTA.", file=sys.stderr)
             return 1
+        omitted = {f[0] for f in failed}
+        print(f"\n  --allow-incomplete: proceeding without {len(omitted)} genome(s)",
+              file=sys.stderr)
+        genomes = [g for g in genomes if g["genome"] not in omitted]
+        contigs = [(n, L) for n, L in contigs if _genome_of(n) not in omitted]
+        want = dict(contigs)
+        order = [n for n, _ in contigs]
 
     print(f"\n  concatenating {len(genomes):,} genome(s) in manifest order")
     seen_names: list[str] = []
@@ -417,7 +513,7 @@ def build(ref: str, out_dir: Path, cache: Path, subset: int | None,
                 print(f"  staged file missing for {g['genome']}",
                       file=sys.stderr)
                 return 1
-            name, length, chunks = None, 0, []
+            name, desc, length, chunks = None, "", 0, []
 
             def emit():
                 if name is None:
@@ -427,14 +523,21 @@ def build(ref: str, out_dir: Path, cache: Path, subset: int | None,
                 seen_names.append(name)
                 if length != want[name]:
                     bad.append((name, want[name], length))
-                w.write(f">{name}\n")
+                # The whole header, not just the name. Staging already wrote
+                # the description where a scheme prefixes rather than renames;
+                # re-parsing with split()[0] here threw it away again, which is
+                # why writing it in stage_bulk changed nothing.
+                w.write(f">{name}{desc}\n")
                 for c in chunks:
                     w.write(c + "\n")
 
             for line in open(src):
                 if line.startswith(">"):
                     emit()
-                    name = line[1:].split()[0]
+                    head = line[1:].rstrip("\n\r")
+                    parts = head.split()
+                    name = parts[0] if parts else head
+                    desc = head[len(name):]
                     length, chunks = 0, []
                 else:
                     s = line.strip()
@@ -469,7 +572,15 @@ def build(ref: str, out_dir: Path, cache: Path, subset: int | None,
     print(f"  {len(order):,} contigs, "
           f"{sum(want.values()):,} bp, all names and lengths match the manifest")
     print(f"  sha256 {h}")
-    (out_dir / f"{fasta.name}.sha256").write_text(f"{h}  {fasta.name}\n")
+    side = f"{h}  {fasta.name}\n"
+    if omitted:
+        side += ("#\n# INCOMPLETE: built without the following genome(s), which\n"
+                 "# could not be fetched from their public source. This FASTA is\n"
+                 "# NOT byte-identical to the reported catalogue.\n"
+                 + "".join(f"# missing: {g}\n" for g in sorted(omitted)))
+        print(f"\n  NOTE: this catalogue is incomplete -- {len(omitted)} genome(s) "
+              f"omitted.\n  The omission is recorded in {fasta.name}.sha256.")
+    (out_dir / f"{fasta.name}.sha256").write_text(side)
 
     # The second thing config needs, derived rather than shipped: every
     # catalogue here is one genome per SGB, so a contig's species is the
@@ -592,6 +703,13 @@ def main() -> int:
     ap.add_argument("--subset", type=int, default=None,
                     help="build only the first N genomes, for proving the "
                          "method without a full rebuild")
+    ap.add_argument("--allow-incomplete", action="store_true",
+                    help="build even if some genomes cannot be fetched. The "
+                         "omission is recorded beside the FASTA, which then "
+                         "states that it is not byte-identical to the "
+                         "reported catalogue. No reference needs this today; "
+                         "it exists so a source going dark degrades to a "
+                         "stated partial result rather than nothing.")
     ap.add_argument("--index", action="store_true",
                     help="run bowtie2-build --large-index on the result")
     ap.add_argument("--verify-only", type=Path, default=None,
@@ -613,7 +731,8 @@ def main() -> int:
         return 2
     if a.verify_only:
         return verify_only(a.ref, a.verify_only)
-    return build(a.ref, a.out, a.cache, a.subset, a.index)
+    return build(a.ref, a.out, a.cache, a.subset, a.index,
+                 a.allow_incomplete)
 
 
 if __name__ == "__main__":

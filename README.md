@@ -178,14 +178,64 @@ every contig name and length against the manifest. It exercises both of
 `carter`'s fetch routes and the full rename-and-verify path in under a minute.
 `--verify-only <fasta>` checks a catalogue you already have.
 
+### A naming trap worth knowing about
+
+Four UHGG genomes carry a version suffix that is **part of the accession**, not
+decoration:
+
+| catalogue name | MGnify genome accession |
+|---|---|
+| `MGYG000001302.1` | `GUT_GENOME095971` |
+| `MGYG000001406.1` | `GUT_GENOME096271` |
+| `MGYG000001455.1` | `GUT_GENOME096401` |
+| `MGYG000001456.1` | `GUT_GENOME096402` |
+
+Request them with the suffix intact and they return normally; strip it and you
+get a 404, which looks convincingly like an upstream retirement. All four are
+present in UHGG v2.0.2 and fetch exactly, so `carter` and `combined` rebuild in
+full.
+
+Three of them also number their contigs with gaps — `MGYG000001406.1` has 60
+contigs whose names run `_1` to `_63`. That is MGnify's own numbering, not
+contigs dropped during catalogue assembly, and the manifest records the names
+verbatim so the rebuild reproduces them.
+
 ### Cost of a full rebuild
 
-| `--ref` | Downloads | Notes |
-|---|---|---|
-| `carter` | 3,971 requests | the slow one: one listing plus one fetch per GenBank accession. Hours, and resumable — the source cache is re-used. |
-| `leviatan` | 1 file, 2.7 GB | fast |
-| `chimp` | 1 file, 8.7 GB | fast |
-| `combined` | re-uses `carter` + `leviatan` sources | build `carter` first and the fetches are already cached |
+Measured on a laptop, not estimated:
+
+| `--ref` | Downloads | Cold | Warm cache |
+|---|---|---|---|
+| `carter` | 3,971 genomes, one listing plus one fetch each | ~27 min | ~4 min |
+| `leviatan` | 1 file, 2.7 GB | ~10 min | ~6 min |
+| `chimp` | 1 file, 8.7 GB — **see below** | — | ~2 min |
+| `combined` | re-uses both caches | — | ~8 min |
+
+Build `carter` and `leviatan` first and `combined` costs almost nothing, because
+it needs no sources of its own. Budget about 19 GB for the source cache, 34 GB
+for the four catalogues, and one extra copy of whichever is building for the
+staging directory.
+
+### The chimp archive needs a manual download
+
+Dryad serves `ChimpMAGs.tar` to browsers but not to scripts: the v2 API download
+endpoint answers `401 Unauthorized, must have current bearer token`, and the
+`file_stream` route the landing page itself uses answers `403 Forbidden` even to
+a plain GET with a browser user-agent. There is no unauthenticated route to
+automate, and no Zenodo mirror.
+
+So `--ref chimp` tries both endpoints, then prints the manual route and stops.
+Download the file from the dataset page, drop it in the cache, and re-run — the
+build picks it up and continues:
+
+```bash
+open https://datadryad.org/dataset/doi:10.5061/dryad.00000006x
+# save ChimpMAGs.tar (8,733,429,248 bytes, CC0) to:
+#   <cache>/bulk/ChimpMAGs.tar
+python workflow/scripts/build_references.py --ref chimp --out references/
+```
+
+The other three catalogues fetch without any manual step.
 
 Budget roughly 15 GB for the source cache on top of the catalogue itself, and
 a further ~22 GB if you let the workflow build the `combined` index.
