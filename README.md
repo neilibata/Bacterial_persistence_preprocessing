@@ -1,4 +1,10 @@
-# Bacterial Evolution & Health Pipeline
+# Preprocessing for the Bacterial Persistence Pipeline
+
+Snakemake workflow that turns raw SRA/ENA reads into the per-sample
+breadth and depth matrices analysed in *Persistence of Non-industrial Gut
+Microbiota Discriminates Health and Disease States in Industrial
+Populations*. The analysis that consumes them is a separate repository,
+`Bacterial_persistence_analysis_pipeline`.
 
 > ### Versions
 >
