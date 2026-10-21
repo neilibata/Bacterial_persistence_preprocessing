@@ -170,6 +170,28 @@ def load_samples():
                 samples.setdefault(match, [match])
     return samples
 
+def require_reference_file(path, what):
+    """Stop with instructions when a reference file has not been built yet.
+
+    The catalogue and its contig map are the only inputs this repository does
+    not ship, and they are the first config paths the workflow touches -- so an
+    unbuilt clone stops here. Without this, it stops on a bare FileNotFoundError
+    naming a path the reader has not met yet.
+    """
+    if os.path.exists(path):
+        return
+    raise WorkflowError(
+        f"{what} {path} does not exist. Neither the reference catalogue nor "
+        f"its contig map is shipped with this repository: they are 3.6-11.8 GB "
+        f"and three of the four are other groups' published data. Build the "
+        f"one you want first --\n"
+        f"    python workflow/scripts/build_references.py --ref combined "
+        f"--out references/\n"
+        f"-- then give config/config.yaml the two paths it prints (bash "
+        f"setup.sh asks for them). --ref takes carter, leviatan, combined or "
+        f"chimp; --subset 12 proves the whole path on 12 genomes first.")
+
+
 def validate_contig_map(path):
     """Fail fast if the map's species column is actually contig-level.
 
@@ -183,6 +205,7 @@ def validate_contig_map(path):
     The signature is unmistakable: a species column with nearly as many
     distinct values as the contig column.
     """
+    require_reference_file(path, "contig map")
     species, contigs, rows = set(), set(), 0
     with open(path) as fh:
         for line in fh:
@@ -266,6 +289,7 @@ for _name, _spec in REFERENCES.items():
     if "fasta" not in _spec or "contig_to_species" not in _spec:
         raise WorkflowError(
             f"reference {_name!r} needs both 'fasta' and 'contig_to_species'")
+    require_reference_file(_spec["fasta"], "reference catalogue")
     validate_contig_map(_spec["contig_to_species"])
 
 def ref_dir(base):

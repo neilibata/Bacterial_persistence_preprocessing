@@ -14,9 +14,19 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "============================================================"
-echo " Bacterial Evolution & Health Pipeline — First-Time Setup"
+echo " Preprocessing for the Bacterial Persistence Pipeline — Setup"
 echo "============================================================"
 echo ""
+
+# Current value of a config key, or empty if the file or the key is absent.
+# Re-running setup.sh must not silently replace a path you already set, so
+# every prompt that can be answered from the existing config defaults to it.
+cfg_val () {
+    local key="$1"
+    [[ -f config/config.yaml ]] || return 0
+    { grep -E "^${key}:" config/config.yaml || true; } \
+        | head -1 | sed -E "s/^${key}:[[:space:]]*//" | tr -d '"'
+}
 
 # --- Detect conda location ---
 CONDA_SH=""
@@ -80,6 +90,16 @@ PART_SHARED=${PART_SHARED:-shared}
 
 read -rp "Download partition (needs internet) [$PART_CPU]: " PART_DL
 PART_DL=${PART_DL:-$PART_CPU}
+
+# Samples above big_sample_mb go to a bigger-memory partition. The shipped
+# default names the one this study used, which exists only on that cluster, so
+# offer it as a default only if this cluster actually has it.
+BIGMEM_DEF=$(cfg_val partition_bigmem)
+if [[ -z "$BIGMEM_DEF" ]] || ! sinfo -h -p "$BIGMEM_DEF" -o '%P' 2>/dev/null | grep -q .; then
+    BIGMEM_DEF=$PART_CPU
+fi
+read -rp "Big-memory partition (large alignments, repair) [$BIGMEM_DEF]: " PART_BIGMEM
+PART_BIGMEM=${PART_BIGMEM:-$BIGMEM_DEF}
 
 # --- Orchestrator partition and walltime ---------------------------------
 # The orchestrator is 1 CPU and 4 GB that mostly sleeps, but it has to stay
@@ -155,10 +175,29 @@ echo "that itself:"
 echo ""
 echo "  python workflow/scripts/build_references.py --ref combined --out references/"
 echo ""
-echo "That writes the FASTA and the contig map, and prints the two config"
-echo "lines to paste below. --ref takes carter, leviatan, combined or chimp;"
-echo "--cite prints every source and its licence. Use --subset 12 first if you"
-echo "want to see the whole path work before committing to the full download."
+echo "That writes the FASTA and the contig map, and prints the two paths asked"
+echo "for below. --ref takes carter, leviatan, combined or chimp; --cite prints"
+echo "every source and its licence. Use --subset 12 first if you want to see"
+echo "the whole path work before committing to the full download."
+echo ""
+
+REF_FASTA_DEF=$(cfg_val reference_fasta)
+REF_FASTA_DEF=${REF_FASTA_DEF:-references/combined.fna}
+read -rp "reference_fasta [$REF_FASTA_DEF]: " REF_FASTA
+REF_FASTA=${REF_FASTA:-$REF_FASTA_DEF}
+
+CONTIG_MAP_DEF=$(cfg_val contig_to_species)
+if [[ -z "$CONTIG_MAP_DEF" ]]; then
+    # Derived from the answer above, since build_references.py writes the two
+    # beside each other and pairing a map with a different catalogue is silent.
+    CONTIG_MAP_DEF="${REF_FASTA%.*}.contig_to_species.tsv"
+fi
+read -rp "contig_to_species [$CONTIG_MAP_DEF]: " CONTIG_MAP
+CONTIG_MAP=${CONTIG_MAP:-$CONTIG_MAP_DEF}
+
+for f in "$REF_FASTA" "$CONTIG_MAP"; do
+    [[ -e "$f" ]] || echo "  note: $f does not exist yet — build it before launching."
+done
 echo ""
 
 # --- Write config ---
@@ -176,8 +215,10 @@ cat > "$CONFIG_FILE" << YAML
 
 # --- Input files ---
 samples_tsv: "resources/samples.tsv"
-reference_fasta: "resources/reference_metagenome.fna"
-contig_to_species: "resources/contig_to_species.tsv"
+
+# Both of these come from one build_references.py run; neither is shipped.
+reference_fasta: "$REF_FASTA"
+contig_to_species: "$CONTIG_MAP"
 
 # --- Output ---
 results_dir: "$RESULTS_DIR"
@@ -186,6 +227,8 @@ results_dir: "$RESULTS_DIR"
 partition_cpu: "$PART_CPU"
 partition_shared: "$PART_SHARED"
 partition_download: "$PART_DL"
+partition_bigmem: "$PART_BIGMEM"
+big_sample_mb: 15000
 slurm_account: "$SLURM_ACCT"
 max_jobs: $MAX_JOBS
 
@@ -289,7 +332,9 @@ echo " Setup complete!"
 echo "============================================================"
 echo ""
 echo " Next steps:"
-echo "   1. Place your input files in resources/"
+echo "   1. Put your accessions in resources/samples.tsv, and build the"
+echo "      catalogue if you have not already:"
+echo "        python workflow/scripts/build_references.py --ref combined --out references/"
 echo "   2. Install the conda environment (if not done):"
 echo "        conda env create -f environment.yaml"
 echo "        conda activate $CONDA_ENV"

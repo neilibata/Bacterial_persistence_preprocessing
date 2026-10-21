@@ -6,8 +6,20 @@
 
 # --- Input files ---
 samples_tsv: "resources/samples.tsv"
-reference_fasta: "resources/reference_metagenome.fna"
-contig_to_species: "resources/contig_to_species.tsv"
+
+# Neither of the next two is shipped: the catalogues are 3.6-11.8 GB and three
+# of the four are other groups' published data. Build the one you want first,
+#
+#   python workflow/scripts/build_references.py --ref combined --out references/
+#
+# which writes exactly these two paths and prints them; setup.sh then asks for
+# them. Both must come from the SAME build -- the contig map is what turns
+# per-contig coverage into per-species coverage, so a map paired with a
+# different catalogue sends every contig it does not recognise to UNKNOWN and
+# still writes a matrix. (resources/contig_to_species.tsv, which IS shipped, is
+# the carter map; it is kept for v1.0 provenance, not as a default.)
+reference_fasta: "references/combined.fna"
+contig_to_species: "references/combined.contig_to_species.tsv"
 
 # --- Output ---
 results_dir: "results"

@@ -13,6 +13,16 @@ Populations*. The analysis that consumes them is a separate repository,
 > | **`v1.0-as-published`** | The pipeline exactly as it produced the matrices used in the manuscript. Preserved unchanged for provenance. It has known defects (below) — use it to reproduce the published matrices, not for new work. |
 > | **`v2.0`** and later | Same analysis, with the defects fixed. Use this for new processing and backfills. |
 >
+> **Everything below describes `main`, and `main` is what to run.**
+> `v1.0-as-published` is a record rather than an entry point: it is four files
+> and two scripts, it predates `build_references.py`, and the
+> `resources/reference_metagenome.fna` it names is a symlink to wherever that
+> catalogue sat on the machine that built it. So the Quick Start cannot be
+> followed from inside that tag. To reproduce the published matrices, rebuild
+> the catalogue from `main` — `build_references.py` checks every contig name
+> and length against the manifest, which the original never did — and run the
+> v1.0 workflow against the result.
+>
 > **Defects in v1.0, all silent:**
 > 1. `combine_aggregated_stats.py` globbed the aggregated directory instead of
 >    using the file list Snakemake declared, so the matrix contained whatever was
@@ -99,8 +109,8 @@ read pairing of every run concatenated after it.
 
 ```bash
 # 1. Clone and enter the repo
-git clone https://github.com/YOUR_USER/Bacterial_evolution_health.git
-cd Bacterial_evolution_health
+git clone https://github.com/neilibata/Bacterial_persistence_preprocessing.git
+cd Bacterial_persistence_preprocessing
 
 # 2. Install the environment (all tools in one conda env)
 conda env create -f environment.yaml
@@ -112,7 +122,9 @@ conda activate bact_evo_pipeline
 #    --subset 12 first if you want to watch the whole path work cheaply.
 python workflow/scripts/build_references.py --ref combined --out references/
 
-# 5. Run interactive setup (detects partitions, conda path, writes config)
+# 5. Run interactive setup (detects partitions and conda, asks for the two
+#    paths step 4 printed, writes config). Re-running it offers whatever the
+#    config already holds as the default, so it never silently replaces them.
 bash setup.sh
 
 # 6. Preview what would run
@@ -166,12 +178,20 @@ inside the workflow, with `--large-index`, which every one of these catalogues
 needs. Run `build_references.py --index` only if you want the index outside a
 workflow run.
 
-Put the two paths into `config.yaml` — the build prints them:
+Put the two paths into `config.yaml` — the build prints them, `setup.sh` asks
+for them, and they are what the shipped `config.yaml` already names:
 
 ```yaml
 reference_fasta:   references/combined.fna
 contig_to_species: references/combined.contig_to_species.tsv
 ```
+
+Both must come from the **same** build. The contig map is what turns per-contig
+coverage into per-species coverage, so a map paired with a different catalogue
+sends every contig it does not recognise to `UNKNOWN` and still writes a
+matrix. (`resources/contig_to_species.tsv`, which this repository does ship, is
+the `carter` map — 3,971 species. It is there because `v1.0-as-published`
+referred to it, not as a default for anything you build now.)
 
 ### Proving it works before committing to the download
 
@@ -435,18 +455,30 @@ The original bash pipeline used `xargs -P 4` to run 4 alignments within a single
 ## Repository Structure
 
 ```
-Bacterial_evolution_health/
+Bacterial_persistence_preprocessing/
 ├── config/
 │   └── config.yaml               ← EDIT THIS (or run setup.sh)
-├── resources/                     ← YOUR INPUT DATA
-│   ├── samples.tsv
-│   ├── reference_metagenome.fna
-│   └── contig_to_species.tsv
+├── resources/
+│   ├── samples.tsv                ← YOUR INPUT: the accessions to process
+│   ├── samples_*.tsv              the sample sets this study ran
+│   ├── lev_*.tsv, lev_*.txt       multi-run reconciliation work lists
+│   ├── contig_to_species.tsv      the `carter` map, kept for v1.0 provenance
+│   └── reference_manifests/       <ref>.genomes.tsv + <ref>.contigs.tsv.gz
+│                                  — what build_references.py verifies against
+├── references/                    (you create: build_references.py --out)
+│   ├── combined.fna               the catalogue, + .sha256
+│   └── combined.contig_to_species.tsv
 ├── workflow/
 │   ├── Snakefile                  pipeline rules
 │   └── scripts/
+│       ├── build_references.py    rebuild + verify a catalogue
+│       ├── fetch_runs.py          SRA/ENA download with cross-fallback
 │       ├── aggregate_coverage.py  contig → species aggregation
-│       └── combine_aggregated_stats.py  per-sample → matrices
+│       ├── combine_aggregated_stats.py  per-sample → matrices
+│       ├── merge_matrix_shards.py dated shards → canonical matrix
+│       ├── verify_completeness.py every requested accession reached it
+│       ├── alignment_qc.py        per-sample alignment summaries
+│       └── record_provenance.sh   tool versions, per run
 ├── profiles/
 │   └── slurm/
 │       ├── config.yaml            SLURM submission settings
