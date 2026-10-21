@@ -3,57 +3,17 @@
 Snakemake workflow that turns raw SRA/ENA reads into the per-sample
 breadth and depth matrices analysed in *Persistence of Non-industrial Gut
 Microbiota Discriminates Health and Disease States in Industrial
-Populations*. The analysis that consumes them is a separate repository,
-`Bacterial_persistence_analysis_pipeline`.
+Populations*. It runs on any SLURM cluster, from raw accessions through
+to per-species coverage matrices. The analysis that consumes them is a
+separate repository,
+[`Bacterial_persistence_analysis_pipeline`](https://github.com/neilibata/Bacterial_persistence_analysis_pipeline).
 
-> ### Versions
->
-> | Tag | What it is |
-> | --- | --- |
-> | **`v1.0-as-published`** | The pipeline exactly as it produced the matrices used in the manuscript. Preserved unchanged for provenance. It has known defects (below) — use it to reproduce the published matrices, not for new work. |
-> | **`v2.0`** and later | Same analysis, with the defects fixed. Use this for new processing and backfills. |
->
-> **Everything below describes `main`, and `main` is what to run.**
-> `v1.0-as-published` is a record rather than an entry point: it is four files
-> and two scripts, it predates `build_references.py`, and the
-> `resources/reference_metagenome.fna` it names is a symlink to wherever that
-> catalogue sat on the machine that built it. So the Quick Start cannot be
-> followed from inside that tag. To reproduce the published matrices, rebuild
-> the catalogue from `main` — `build_references.py` checks every contig name
-> and length against the manifest, which the original never did — and run the
-> v1.0 workflow against the result.
->
-> **Defects in v1.0, all silent:**
-> 1. `combine_aggregated_stats.py` globbed the aggregated directory instead of
->    using the file list Snakemake declared, so the matrix contained whatever was
->    on disk — omitting samples that failed upstream, and including samples left
->    over from earlier runs.
-> 2. An unreadable per-sample CSV was warned about and skipped; the matrix was
->    written anyway.
-> 3. No check that every requested accession reached the matrix. 398 samples were
->    absent from one reference catalogue and this was not discovered until
->    analysis, months later.
-> 4. `repair.sh` (a JVM tool) ran without `-Xmx`, so it sized its heap from node
->    memory and was killed by the SLURM cgroup at the requested limit.
-> 5. Alignment memory was modelled as `input_size x 5`, but bowtie2's footprint is
->    dominated by the resident index and is essentially flat in sample size — so
->    large samples were under-provisioned and OOM-killed.
-> 6. `bowtie2 -p N` plus `samtools --threads 4` twice requested more threads than
->    the allocation had.
-> 7. No record of tool versions, so v1.0 outputs cannot be tied to specific builds.
-> 8. Every accession was treated as its own sample, so a sample sequenced across
->    several runs produced one matrix row *per run* instead of one per sample.
->    16% of this cohort is multi-run. The damage is not repairable after the
->    fact — breadth is a percentage of genome covered, so per-run breadths
->    cannot be pooled without the original alignments; 89 samples had to be
->    reprocessed from raw reads. *(Fixed in v3.0.)*
->
-> v2.0 fixes 1–7; v3.0 fixes 8. Outputs are written as **dated shards**
-> (`depth_matrix_YYYYMMDD.csv`) and merged into the canonical matrix, so a
-> backfill never rewrites samples that are already done.
+**Run `main`.** Start at [Quick Start](#quick-start).
 
-
-A Snakemake pipeline that processes shotgun metagenomic data from raw SRA accessions to per-species coverage matrices on any SLURM cluster. Built for investigating bacterial evolutionary dynamics across human populations.
+The `v1.0-as-published` tag is the workflow that produced the matrices in
+the manuscript, kept for provenance. It is a record rather than an entry
+point, and it has known defects that `main` fixes; both are described
+under [Versions and provenance](#versions-and-provenance) at the end.
 
 ## What You Provide
 
@@ -600,6 +560,53 @@ Two sample × species matrices are produced as the final deliverables:
 - **`coverage_matrix.csv`** — same layout for breadth-of-coverage
 
 Species column order is fixed by `contig_to_species.tsv`, so all matrices are directly comparable.
+
+## Versions and provenance
+
+| Tag | What it is |
+| --- | --- |
+| **`v1.0-as-published`** | The workflow exactly as it produced the matrices used in the manuscript. Preserved unchanged for provenance. It has the defects listed below — use it to reproduce those matrices, not for new work. |
+| **`v2.0`** and later | Same analysis, with the defects fixed. Use this for new processing and backfills. |
+
+Everything else in this README describes `main`, and `main` is what to
+run. `v1.0-as-published` is a record rather than an entry point: it is
+fourteen tracked files, it predates `build_references.py`, and the
+`resources/reference_metagenome.fna` it names is a symlink to wherever
+that catalogue sat on the machine that built it. So the Quick Start
+cannot be followed from inside that tag. To reproduce the published
+matrices, rebuild the catalogue from `main` — `build_references.py`
+checks every contig name and length against the manifest, which the
+original never did — and run the v1.0 workflow against the result.
+
+**Defects in v1.0, all silent:**
+
+1. `combine_aggregated_stats.py` globbed the aggregated directory instead of
+   using the file list Snakemake declared, so the matrix contained whatever was
+   on disk — omitting samples that failed upstream, and including samples left
+   over from earlier runs.
+2. An unreadable per-sample CSV was warned about and skipped; the matrix was
+   written anyway.
+3. No check that every requested accession reached the matrix. 398 samples were
+   absent from one reference catalogue and this was not discovered until
+   analysis, months later.
+4. `repair.sh` (a JVM tool) ran without `-Xmx`, so it sized its heap from node
+   memory and was killed by the SLURM cgroup at the requested limit.
+5. Alignment memory was modelled as `input_size x 5`, but bowtie2's footprint is
+   dominated by the resident index and is essentially flat in sample size — so
+   large samples were under-provisioned and OOM-killed.
+6. `bowtie2 -p N` plus `samtools --threads 4` twice requested more threads than
+   the allocation had.
+7. No record of tool versions, so v1.0 outputs cannot be tied to specific builds.
+8. Every accession was treated as its own sample, so a sample sequenced across
+   several runs produced one matrix row *per run* instead of one per sample.
+   16% of this cohort is multi-run. The damage is not repairable after the
+   fact — breadth is a percentage of genome covered, so per-run breadths
+   cannot be pooled without the original alignments; 89 samples had to be
+   reprocessed from raw reads. *(Fixed in v3.0.)*
+
+v2.0 fixes 1–7; v3.0 fixes 8. Outputs are written as **dated shards**
+(`depth_matrix_YYYYMMDD.csv`) and merged into the canonical matrix, so a
+backfill never rewrites samples that are already done.
 
 ## Software
 
