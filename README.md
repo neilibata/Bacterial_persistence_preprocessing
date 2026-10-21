@@ -565,18 +565,27 @@ Species column order is fixed by `contig_to_species.tsv`, so all matrices are di
 
 | Tag | What it is |
 | --- | --- |
-| **`v1.0-as-published`** | The workflow exactly as it produced the matrices used in the manuscript. Preserved unchanged for provenance. It has the defects listed below — use it to reproduce those matrices, not for new work. |
+| **`v1.0-as-published`** | The workflow as it produced the matrices used in the manuscript, kept for provenance. Its code and configuration are unaltered; the one exception is noted below. It has the defects listed below — use it to reproduce those matrices, not for new work. |
 | **`v2.0`** and later | Same analysis, with the defects fixed. Use this for new processing and backfills. |
 
 Everything else in this README describes `main`, and `main` is what to
 run. `v1.0-as-published` is a record rather than an entry point: it is
-fourteen tracked files, it predates `build_references.py`, and the
-`resources/reference_metagenome.fna` it names is a symlink to wherever
-that catalogue sat on the machine that built it. So the Quick Start
-cannot be followed from inside that tag. To reproduce the published
-matrices, rebuild the catalogue from `main` — `build_references.py`
-checks every contig name and length against the manifest, which the
-original never did — and run the v1.0 workflow against the result.
+fourteen tracked files and it predates `build_references.py`. So the
+Quick Start cannot be followed from inside that tag. To reproduce the
+published matrices, rebuild the catalogue from `main` —
+`build_references.py` checks every contig name and length against the
+manifest, which the original never did — and run the v1.0 workflow
+against the result.
+
+**The one alteration to the tagged history.** Every v1.x tag carried
+`resources/reference_metagenome.fna` as a symlink, and its target was an
+absolute path on the machine that built the published matrices — it
+pointed at the Carter (`Hadza_UHGG`) catalogue. Publishing that path
+would have disclosed a filesystem layout that exists nowhere else and
+helps nobody, so in every tag that path now holds a short note saying
+what the symlink pointed at. Nothing else in any tag changed: `main`'s
+tree is byte-for-byte what it was, and each tag's tree differs from the
+original at that one path and no other.
 
 **Defects in v1.0, all silent:**
 
